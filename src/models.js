@@ -64,3 +64,33 @@ export function embeddingNeurons(totalChars) {
 export function publicModels() {
   return CHAT_MODELS.map((m) => ({ id: m.id, label: m.label }));
 }
+
+/* ---------------- image generation ---------------- */
+
+/**
+ * Text-to-image models on Workers AI.
+ * `returns`: "base64" = {image: "<base64>"} JSON, "binary" = raw stream.
+ * Verified against Workers AI docs (flux-1-schnell returns base64 JSON,
+ * dreamshaper-8-lcm returns a binary stream).
+ */
+export const IMAGE_MODELS = [
+  {
+    id: "@cf/black-forest-labs/flux-1-schnell",
+    label: "FLUX.1 Schnell — الأسرع والأجود (افتراضي)",
+    returns: "base64",
+  },
+  {
+    id: "@cf/lykon/dreamshaper-8-lcm",
+    label: "Dreamshaper 8 LCM — بديل سريع",
+    returns: "binary",
+  },
+];
+export const DEFAULT_IMAGE_MODEL = IMAGE_MODELS[0].id;
+
+export function getImageModel(id) {
+  return IMAGE_MODELS.find((m) => m.id === id) || IMAGE_MODELS[0];
+}
+
+export function publicImageModels() {
+  return IMAGE_MODELS.map((m) => ({ id: m.id, label: m.label }));
+}
