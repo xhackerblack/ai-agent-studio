@@ -124,6 +124,7 @@ function showView(name) {
   }
   if (name === "dashboard") loadDashboard();
   if (name === "settings") loadSettings();
+  if (name === "images") renderGallery();
   if (name === "chat") setTimeout(() => $("chat-log").scrollTop = $("chat-log").scrollHeight, 60);
   window.scrollTo(0, 0);
 }
@@ -317,21 +318,41 @@ async function renderChatHistory() {
     const res = await fetch(`/api/conversations/detail?id=${state.currentConv}`, { headers: headers() });
     if (!res.ok) throw new Error("network");
     const { conversation } = await res.json();
-    for (const m of conversation.messages || []) addMsg(m.role, m.content, m.tools || [], true);
+    for (const m of conversation.messages || []) addMsg(m.role, m.content, m.tools || [], m.images || [], true);
     log.scrollTop = log.scrollHeight;
   } catch { log.innerHTML = '<p class="muted" style="text-align:center">ابدأ الكتابة بالأسفل 💬</p>'; }
 }
 
-function addMsg(role, content, tools = [], instant = false) {
+function addMsg(role, content, tools = [], images = [], instant = false) {
   const log = $("chat-log");
   const d = document.createElement("div");
   d.className = "msg " + (role === "user" ? "user" : "bot");
   d.innerHTML = (tools.length
     ? tools.map((t) => `<span class="toolbadge">🔧 ${escapeHtml(t)}</span>`).join("") + "<br>"
     : "") + escapeHtml(content);
+  for (const id of images || []) {
+    const img = document.createElement("img");
+    img.className = "gen-img";
+    img.src = "/api/images/" + id;
+    img.loading = "lazy";
+    img.alt = "صورة مولدة بالذكاء الاصطناعي";
+    img.onclick = () => openViewer(img.src);
+    d.appendChild(img);
+  }
   log.appendChild(d);
   if (!instant) log.scrollTop = log.scrollHeight;
   return d;
+}
+
+/** Fullscreen image viewer */
+function openViewer(src) {
+  const v = document.createElement("div");
+  v.className = "img-viewer";
+  const safe = String(src).replace(/"/g, "");
+  v.innerHTML = `<button class="close" aria-label="إغلاق">✕</button><img src="${safe}" alt="صورة">`;
+  v.querySelector(".close").onclick = () => v.remove();
+  v.addEventListener("click", (e) => { if (e.target === v) v.remove(); });
+  document.body.appendChild(v);
 }
 
 function autoGrow() {
@@ -397,6 +418,21 @@ async function sendMessage() {
         }
         else if (obj.type === "tool") { $("chat-tools").textContent = `🔧 يستخدم: ${obj.icon} ${obj.label}…`; }
         else if (obj.type === "conversation") { state.currentConv = obj.id; }
+        else if (obj.type === "done") {
+          for (const id of obj.images || []) {
+            const img = document.createElement("img");
+            img.className = "gen-img";
+            img.src = "/api/images/" + id;
+            img.loading = "lazy";
+            img.alt = "صورة مولدة بالذكاء الاصطناعي";
+            img.onclick = () => openViewer(img.src);
+            botEl.appendChild(img);
+          }
+          if (obj.images && obj.images.length) {
+            $("chat-log").scrollTop = $("chat-log").scrollHeight;
+            toast("🎨 تم توليد الصورة!");
+          }
+        }
         else if (obj.type === "error") throw Object.assign(new Error(obj.code || "upstream"), { code: obj.code, detail: obj.detail || "" });
       }
     }
@@ -453,6 +489,115 @@ $("btn-train-open").onclick = () => {
   };
 };
 
+/* ---------- Image studio ---------- */
+
+const IMG_STYLES = [
+  { label: "🌅 واقعي", suffix: ", photorealistic, ultra detailed, 8k, professional photography" },
+  { label: "🎠 كرتوني", suffix: ", cartoon style, vibrant colors, clean bold lines" },
+  { label: "⛩️ أنمي", suffix: ", anime style, detailed, beautiful lighting" },
+  { label: "🖼️ زيتي", suffix: ", classical oil painting, rich textures, museum quality" },
+  { label: "🌃 سايبربانك", suffix: ", cyberpunk, neon lights, futuristic, dramatic atmosphere" },
+  { label: "🏔️ طبيعة", suffix: ", breathtaking landscape, golden hour, national geographic" },
+];
+let activeStyle = -1;
+
+function renderImgStyles() {
+  const box = $("img-styles");
+  box.innerHTML = "";
+  IMG_STYLES.forEach((s, i) => {
+    const c = document.createElement("button");
+    c.className = "chip" + (activeStyle === i ? " on" : "");
+    c.textContent = s.label;
+    c.onclick = () => { activeStyle = activeStyle === i ? -1 : i; renderImgStyles(); };
+    box.appendChild(c);
+  });
+}
+
+function fillImageModels() {
+  const sel = $("img-model");
+  sel.innerHTML = (state.config?.imageModels || [])
+    .map((m) => `<option value="${m.id}">${escapeHtml(m.label)}</option>`).join("");
+}
+
+function recentImages() {
+  try { return JSON.parse(localStorage.getItem("aas_imgs") || "[]"); } catch { return []; }
+}
+function saveRecentImage(id, prompt) {
+  const list = [{ id, prompt, at: Date.now() }, ...recentImages()].slice(0, 24);
+  try { localStorage.setItem("aas_imgs", JSON.stringify(list)); } catch { /* storage full */ }
+}
+function renderGallery() {
+  const g = $("img-gallery");
+  if (!g) return;
+  const list = recentImages();
+  g.innerHTML = list.length ? "" : '<p class="muted">لا صور بعد — ولّد أول صورة! ✨</p>';
+  for (const it of list) {
+    const img = document.createElement("img");
+    img.src = "/api/images/" + it.id;
+    img.loading = "lazy";
+    img.alt = it.prompt || "صورة مولدة";
+    img.title = it.prompt || "";
+    img.onclick = () => openViewer(img.src);
+    g.appendChild(img);
+  }
+}
+
+function initImageStudio() {
+  renderImgStyles();
+  fillImageModels();
+  renderGallery();
+  $("btn-generate").onclick = async () => {
+    const ta = $("img-prompt");
+    let prompt = ta.value.trim();
+    if (!prompt) return toast("اكتب وصف الصورة أولاً", true);
+    if (activeStyle >= 0) prompt += IMG_STYLES[activeStyle].suffix;
+    const st = $("img-status");
+    const resBox = $("img-result");
+    st.classList.remove("hidden");
+    st.className = "note";
+    st.textContent = "⏳ جارٍ الرسم… (قد يستغرق ١٠–٣٠ ثانية)";
+    $("btn-generate").disabled = true;
+    try {
+      const r = await api("/api/generate-image", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompt, model: $("img-model").value }),
+      });
+      st.classList.add("hidden");
+      saveRecentImage(r.id, prompt);
+      resBox.classList.remove("hidden");
+      resBox.innerHTML = `<div class="card img-result-card">
+        <img class="gen-img" id="img-latest" src="${r.url}" alt="صورة مولدة">
+        <div class="row" style="margin-top:10px">
+          <button class="btn primary" id="img-dl" style="flex:1">⬇️ تحميل</button>
+          <button class="btn" id="img-view" style="flex:1">🔍 عرض مكبّر</button>
+        </div></div>`;
+      $("img-view").onclick = () => openViewer(r.url);
+      $("img-latest").onclick = () => openViewer(r.url);
+      $("img-dl").onclick = async () => {
+        try {
+          const resp = await fetch(r.url);
+          const blob = await resp.blob();
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "ai-image-" + r.id.slice(0, 8) + ".png";
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+          toast("تم تحميل الصورة ⬇️");
+        } catch { window.open(r.url, "_blank"); }
+      };
+      renderGallery();
+      toast("تم توليد الصورة! 🎨");
+    } catch (e) {
+      st.className = "note err";
+      st.textContent = "❌ " + errText(e);
+    } finally {
+      $("btn-generate").disabled = false;
+    }
+  };
+}
+
 /* ---------- Dashboard ---------- */
 async function loadDashboard() {
   const cards = $("dash-cards");
@@ -467,6 +612,7 @@ async function loadDashboard() {
     cards.innerHTML = `
       <div class="card"><h3>🤖 الوكلاء</h3><b style="font-size:26px">${s.agents}</b></div>
       <div class="card"><h3>💬 رسائل اليوم</h3><b style="font-size:26px">${s.today.messages}</b></div>
+      <div class="card"><h3>🎨 صور اليوم</h3><b style="font-size:26px">${s.today.images || 0}</b></div>
       <div class="card"><h3>🔧 الأدوات اليوم</h3><b style="font-size:26px">${s.today.toolCalls}</b></div>
       <div class="card"><h3>⚡ خلايا اليوم</h3><b style="font-size:26px">${s.today.neurons.toLocaleString("ar")}</b></div>`;
     drawChart(s.series);
@@ -650,6 +796,7 @@ $("btn-save-pw").onclick = () => {
   renderSuggestions();
   try {
     state.config = await api("/api/config");
+    initImageStudio();
     await loadAgents();
     if (!state.agents.length) {
       try {
