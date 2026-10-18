@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1a1033">
+<title>استوديو وكلاء الذكاء الاصطناعي</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="/icons/icon-192.png">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">🤖 استوديو الوكلاء</div>
+  <div class="quota" id="quota-chip" title="الحصة اليومية">…</div>
+</header>
+
+<main id="views">
+  <!-- HOME -->
+  <section class="view active" id="view-home">
+    <div class="hero">
+      <h1>ابنِ وكيل ذكاء اصطناعي خاص بك</h1>
+      <p>صِفه بجملة واحدة، درّبه بملف واحد، وشاهده يتعلم بنفسه.</p>
+      <button class="btn primary big" id="cta-create">✨ أنشئ وكيلك الأول</button>
+    </div>
+    <h2>إجراءات سريعة</h2>
+    <div class="grid2">
+      <button class="card action" data-go="agents">🤖<span>وكلائي</span></button>
+      <button class="card action" data-go="chat">💬<span>محادثة</span></button>
+      <button class="card action" data-go="dashboard">📊<span>لوحة التحكم</span></button>
+      <button class="card action" data-go="settings">⚙️<span>الإعدادات</span></button>
+    </div>
+    <h2>كيف يعمل؟</h2>
+    <ol class="steps">
+      <li><b>١.</b> أنشئ وكيلاً أو صِفه بجملة واحدة.</li>
+      <li><b>٢.</b> ارفع ملفاً واحداً ليتدرب عليه تلقائياً.</li>
+      <li><b>٣.</b> تحدث معه — سيستخلص الدروس ويحسّن نفسه بنفسه.</li>
+    </ol>
+  </section>
+
+  <!-- AGENTS -->
+  <section class="view" id="view-agents">
+    <div class="row space">
+      <h1>وكلائي</h1>
+      <button class="btn primary" id="btn-new-agent">＋ جديد</button>
+    </div>
+    <div class="card">
+      <h3>✨ تخصيص سريع — صف ما تريد بجملة واحدة</h3>
+      <textarea id="quick-desc" rows="2" placeholder="مثال: وكيل خبير في أسعار الذهب يجيب باختصار"></textarea>
+      <button class="btn primary" id="btn-quick">ولّد الوكيل</button>
+      <div id="quick-result" class="hidden"></div>
+    </div>
+    <div id="agents-list" class="stack"></div>
+  </section>
+
+  <!-- CHAT -->
+  <section class="view" id="view-chat">
+    <div class="chat-top">
+      <select id="chat-agent"></select>
+      <button class="btn small" id="btn-new-conv">＋</button>
+      <select id="chat-conv"></select>
+    </div>
+    <div id="chat-log" class="chat-log"></div>
+    <div id="chat-tools" class="chat-tools"></div>
+    <div class="chat-input">
+      <input id="chat-text" type="text" placeholder="اكتب رسالتك…" autocomplete="off">
+      <button class="btn primary" id="btn-send">إرسال</button>
+    </div>
+    <div class="row">
+      <button class="btn small" id="btn-learn-now">🧠 اجعله يتعلم من هذه المحادثة</button>
+      <button class="btn small" id="btn-train-open">📄 درّبه بملف</button>
+    </div>
+    <div id="learn-status" class="note hidden"></div>
+  </section>
+
+  <!-- DASHBOARD -->
+  <section class="view" id="view-dashboard">
+    <h1>لوحة التحكم</h1>
+    <div class="grid2" id="dash-cards"></div>
+    <div class="card">
+      <h3>النشاط — آخر ٧ أيام</h3>
+      <canvas id="dash-chart" height="140"></canvas>
+    </div>
+    <div class="card">
+      <h3>🧠 سجل التعلّم الذاتي</h3>
+      <select id="learn-agent"></select>
+      <div id="learn-log" class="timeline"></div>
+    </div>
+    <div class="card">
+      <h3>🗂️ ملفات التدريب</h3>
+      <select id="know-agent"></select>
+      <div id="know-list" class="stack"></div>
+    </div>
+    <div class="card">
+      <h3>🧰 الأدوات</h3>
+      <div id="tools-list" class="stack"></div>
+      <details>
+        <summary>＋ إضافة أداة مخصصة (API خارجي)</summary>
+        <input id="ct-name" placeholder="اسم الأداة">
+        <input id="ct-base" placeholder="https://api.example.com" dir="ltr">
+        <input id="ct-desc" placeholder="وصف قصير">
+        <button class="btn" id="btn-add-tool">حفظ الأداة</button>
+      </details>
+    </div>
+    <div class="card">
+      <h3>⏰ التذكيرات</h3>
+      <select id="rem-agent"></select>
+      <div id="rem-list" class="stack"></div>
+    </div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section class="view" id="view-settings">
+    <h1>الإعدادات</h1>
+    <div class="card">
+      <h3>🔐 كلمة مرور التطبيق (اختياري)</h3>
+      <p class="muted">إن عيّنتها على الخادم (APP_PASSWORD) أدخلها هنا لحفظها على هذا الجهاز.</p>
+      <input id="set-password" type="password" placeholder="كلمة المرور" dir="ltr">
+      <button class="btn" id="btn-save-pw">حفظ</button>
+    </div>
+    <div class="card">
+      <h3>💾 الذاكرة الدائمة</h3>
+      <select id="mem-agent"></select>
+      <div id="mem-list" class="stack"></div>
+    </div>
+    <div class="card">
+      <h3>ℹ️ عن التطبيق</h3>
+      <p class="muted">استوديو وكلاء الذكاء الاصطناعي — يعمل بالكامل على Cloudflare (Workers AI + KV)، مجاني حتى ١٠٬٠٠٠ خلية عصبية يومياً.</p>
+      <p class="muted">العقل: نموذج لغوي. التعلّم والذاكرة والتحسين: ذاتية وتعمل في الخلفية.</p>
+    </div>
+  </section>
+</main>
+
+<!-- Agent editor modal -->
+<div id="agent-modal" class="modal hidden">
+  <div class="modal-body">
+    <h2 id="am-title">وكيل جديد</h2>
+    <input id="am-name" placeholder="الاسم">
+    <input id="am-avatar" placeholder="الأيقونة (إيموجي)">
+    <input id="am-desc" placeholder="وصف قصير">
+    <input id="am-tone" placeholder="النبرة (مثال: ودود ومختصر)">
+    <select id="am-model"></select>
+    <textarea id="am-prompt" rows="4" placeholder="تعليمات النظام"></textarea>
+    <div id="am-tools" class="chips"></div>
+    <div class="row">
+      <button class="btn primary" id="am-save">حفظ</button>
+      <button class="btn" id="am-cancel">إلغاء</button>
+    </div>
+  </div>
+</div>
+
+<!-- Training modal -->
+<div id="train-modal" class="modal hidden">
+  <div class="modal-body">
+    <h2>📄 تدريب بملف واحد</h2>
+    <p class="muted">ارفع ملفاً (TXT / MD / CSV / JSON / HTML — وPDF تجريبياً) وسيتعلم منه الوكيل تلقائياً.</p>
+    <input type="file" id="train-file" accept=".txt,.md,.csv,.json,.html,.pdf">
+    <div class="row">
+      <button class="btn primary" id="btn-train-start">ابدأ التدريب</button>
+      <button class="btn" id="btn-train-cancel">إلغاء</button>
+    </div>
+    <div id="train-status" class="note hidden"></div>
+  </div>
+</div>
+
+<nav class="bottomnav">
+  <button data-view="home" class="active">🏠<span>الرئيسية</span></button>
+  <button data-view="agents">🤖<span>الوكلاء</span></button>
+  <button data-view="chat">💬<span>المحادثة</span></button>
+  <button data-view="dashboard">📊<span>اللوحة</span></button>
+  <button data-view="settings">⚙️<span>الإعدادات</span></button>
+</nav>
+
+<script src="/app.js"></script>
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));
+}
+</script>
+</body>
+</html>
