@@ -1,5 +1,5 @@
 /* AI Agent Studio service worker — offline shell for the PWA. */
-const CACHE = "aas-v1";
+const CACHE = "aas-v2";
 const SHELL = ["/", "/index.html", "/styles.css", "/app.js", "/manifest.json"];
 
 self.addEventListener("install", (e) => {
