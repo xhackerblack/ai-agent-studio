@@ -19,6 +19,8 @@ export function defaultAgent(overrides = {}) {
     model: DEFAULT_CHAT_MODEL,
     systemPrompt: "أنت وكيل ذكاء اصطناعي مساعد، ودود ومختصر. أجب بالعربية ما لم يُطلب غير ذلك.",
     tools: ["calculator", "datetime", "url_fetch"],
+    skillIds: [],
+    autoLearn: false,
     isActive: true,
     createdAt: new Date().toISOString(),
     ...overrides,
