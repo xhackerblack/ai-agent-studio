@@ -79,6 +79,23 @@
     <div id="learn-status" class="note hidden"></div>
   </section>
 
+  <!-- IMAGES -->
+  <section class="view" id="view-images" data-title="🎨 استوديو الصور">
+    <div class="card">
+      <h3>🎨 ولّد صورة بالذكاء الاصطناعي</h3>
+      <p class="muted">اكتب الوصف بالإنجليزية لأفضل نتيجة:</p>
+      <textarea id="img-prompt" rows="3" placeholder="مثال: a cozy bakery at sunrise, warm light, ultra detailed"></textarea>
+      <div class="chips" id="img-styles"></div>
+      <select id="img-model" aria-label="نموذج الرسم"></select>
+      <button class="btn primary big" id="btn-generate">✨ ولّد الصورة</button>
+      <div id="img-status" class="note hidden"></div>
+    </div>
+    <div id="img-result" class="hidden"></div>
+    <h2>🖼️ صوري الأخيرة</h2>
+    <div id="img-gallery" class="img-grid"></div>
+    <div class="fab-space"></div>
+  </section>
+
   <!-- DASHBOARD -->
   <section class="view" id="view-dashboard" data-title="📊 لوحة التحكم">
     <div class="grid2" id="dash-cards"></div>
@@ -148,6 +165,7 @@
   <button data-view="home" class="active"><span class="nic">🏠</span><span>الرئيسية</span></button>
   <button data-view="agents"><span class="nic">🤖</span><span>الوكلاء</span></button>
   <button data-view="chat"><span class="nic">💬</span><span>المحادثة</span></button>
+  <button data-view="images"><span class="nic">🎨</span><span>الصور</span></button>
   <button data-view="dashboard"><span class="nic">📊</span><span>اللوحة</span></button>
   <button data-view="settings"><span class="nic">⚙️</span><span>الإعدادات</span></button>
 </nav>
