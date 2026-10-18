@@ -125,6 +125,12 @@ function showView(name) {
   if (name === "dashboard") loadDashboard();
   if (name === "settings") loadSettings();
   if (name === "images") renderGallery();
+  if (brainTimer) { clearInterval(brainTimer); brainTimer = null; }
+  if (name === "brain") {
+    ensureBrainCanvas();
+    loadBrain();
+    brainTimer = setInterval(() => { if (!document.hidden) loadBrain(true); }, 25000);
+  }
   if (name === "chat") setTimeout(() => $("chat-log").scrollTop = $("chat-log").scrollHeight, 60);
   window.scrollTo(0, 0);
 }
@@ -183,7 +189,7 @@ async function loadAgents() {
 
 function fillAgentSelects() {
   const opts = state.agents.map((a) => `<option value="${a.id}">${a.avatar} ${escapeHtml(a.name)}</option>`).join("");
-  for (const id of ["chat-agent", "learn-agent", "know-agent", "rem-agent", "mem-agent"]) {
+  for (const id of ["chat-agent", "learn-agent", "know-agent", "rem-agent", "mem-agent", "brain-agent"]) {
     const el = $(id);
     if (el) {
       const cur = el.value;
@@ -193,6 +199,27 @@ function fillAgentSelects() {
   }
   if (state.agents.length && !$("chat-agent").value) setChatAgent(state.agents[0].id);
 }
+$("brain-agent").addEventListener("change", () => loadBrain());
+$("btn-brain-refresh").addEventListener("click", () => { toast("🔄 تحديث العقل…"); loadBrain(); });
+$("autolearn-toggle").addEventListener("click", async (e) => {
+  e.stopPropagation();
+  const id = $("brain-agent").value;
+  const agent = state.agents.find((a) => a.id === id);
+  if (!agent) return toast("اختر وكيلاً أولاً", true);
+  const v = !agent.autoLearn;
+  try {
+    await api(`/api/agents/${id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ autoLearn: v }),
+    });
+    agent.autoLearn = v;
+    $("autolearn-toggle").classList.toggle("on", v);
+    $("autolearn-toggle").setAttribute("aria-checked", String(v));
+    toast(v
+      ? "🧠 التعلّم الذاتي مفعّل — سيلاحظ أخطاءه ويتعلم بعد كل محادثة تلقائياً"
+      : "تم إيقاف التعلّم الذاتي التلقائي");
+  } catch (err) { toast(errText(err), true); }
+});
 
 /* Agent editor (bottom sheet) */
 let editingId = null, modalTools = [];
@@ -212,9 +239,46 @@ function openAgentModal(a) {
     <textarea id="am-prompt" rows="4" placeholder="تعليمات النظام — شخصية الوكيل وخبرته">${escapeHtml(a?.systemPrompt || "")}</textarea>
     <h3>🧰 الأدوات المفعّلة</h3>
     <div id="am-tools" class="chips"></div>
+    <h3>🧩 المهارات المدمجة</h3>
+    <div id="am-skills" class="chips"><span class="muted">جارٍ التحميل…</span></div>
+    <p class="muted" style="font-size:13px;margin:0 0 6px">أضف مهارات جديدة من لوحة التحكم ← مكتبة المهارات</p>
+    <label class="switch-row"><span>🧠 تعلّم ذاتي تلقائي <small class="muted">— بعد كل محادثة</small></span><button type="button" class="switch" id="am-autolearn" role="switch" aria-label="التعلم الذاتي"></button></label>
     <button class="btn primary big" id="am-save">💾 حفظ الوكيل</button>`);
   renderModalTools();
+  modalSkillIds = [...(a?.skillIds || [])];
+  modalAutoLearn = !!a?.autoLearn;
+  renderSkillChips();
+  const autoSw = $("am-autolearn");
+  autoSw.classList.toggle("on", modalAutoLearn);
+  autoSw.onclick = () => { modalAutoLearn = !modalAutoLearn; autoSw.classList.toggle("on", modalAutoLearn); };
   $("am-save").onclick = saveAgentModal;
+}
+let modalSkillIds = [], modalAutoLearn = false, skillsCache = null;
+async function getSkillsCache() {
+  if (!skillsCache) skillsCache = (await api("/api/skills")).skills;
+  return skillsCache;
+}
+async function renderSkillChips() {
+  const box = $("am-skills");
+  if (!box) return;
+  try {
+    const skills = await getSkillsCache();
+    box.innerHTML = "";
+    if (!skills.length) box.innerHTML = '<span class="muted">لا مهارات بعد — أنشئ من لوحة التحكم</span>';
+    for (const s of skills) {
+      const c = document.createElement("button");
+      c.type = "button";
+      c.className = "chip" + (modalSkillIds.includes(s.id) ? " on" : "");
+      c.textContent = `${s.icon} ${s.name}`;
+      c.onclick = () => {
+        modalSkillIds = modalSkillIds.includes(s.id)
+          ? modalSkillIds.filter((x) => x !== s.id)
+          : [...modalSkillIds, s.id];
+        renderSkillChips();
+      };
+      box.appendChild(c);
+    }
+  } catch { box.innerHTML = '<span class="muted">تعذّر تحميل المهارات</span>'; }
 }
 function renderModalTools() {
   const box = $("am-tools");
@@ -238,7 +302,7 @@ async function saveAgentModal() {
     avatar: $("am-avatar").value || "🤖",
     description: $("am-desc").value, tone: $("am-tone").value,
     model: $("am-model").value, systemPrompt: $("am-prompt").value,
-    tools: modalTools,
+    tools: modalTools, skillIds: modalSkillIds, autoLearn: modalAutoLearn,
   };
   try {
     if (editingId) await api(`/api/agents/${editingId}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
@@ -489,6 +553,328 @@ $("btn-train-open").onclick = () => {
   };
 };
 
+/* ---------- Brain: live knowledge graph ---------- */
+
+const KIND_COLORS = {
+  agent: "#a78bfa", memory: "#8b5cf6", lesson: "#34d399", file: "#60a5fa",
+  chunk: "#38bdf8", tool: "#fbbf24", skill: "#f472b6", event: "#f87171",
+};
+const KIND_AR = {
+  agent: "الوكيل", memory: "ذاكرة دائمة", lesson: "درس مستخلص", file: "ملف تدريب",
+  chunk: "مقطع معرفي", tool: "أداة", skill: "مهارة مدمجة", event: "حدث تعلّم",
+};
+
+const Brain = {
+  nodes: [], edgeIdx: [],
+  canvas: null, ctx: null, ready: false,
+  scale: 1, ox: 0, oy: 0, cx: 0, cy: 0,
+  running: false, still: 0,
+  dragNode: null, pointers: new Map(),
+  panStart: null, downAt: 0, downXY: null, movedFar: false,
+  pinchD: 0,
+  posMemory: new Map(),
+  stars: [],
+};
+let brainTimer = null;
+
+function ensureBrainCanvas() {
+  if (Brain.ready) { brainResize(); return; }
+  Brain.canvas = $("brain-canvas");
+  Brain.ctx = Brain.canvas.getContext("2d");
+  Brain.ready = true;
+  // static starfield
+  for (let i = 0; i < 90; i++) {
+    Brain.stars.push({ x: Math.random(), y: Math.random(), r: Math.random() * 1.4 + 0.3, a: Math.random() * 0.5 + 0.15 });
+  }
+  brainResize();
+  window.addEventListener("resize", brainResize);
+
+  const cv = Brain.canvas;
+  cv.addEventListener("pointerdown", (e) => {
+    cv.setPointerCapture(e.pointerId);
+    Brain.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    Brain.downAt = Date.now();
+    Brain.downXY = { x: e.clientX, y: e.clientY };
+    Brain.movedFar = false;
+    if (Brain.pointers.size === 1) {
+      const n = brainHit(e.clientX, e.clientY);
+      if (n) { Brain.dragNode = n; }
+      else { Brain.panStart = { x: e.clientX - Brain.ox, y: e.clientY - Brain.oy }; }
+    } else if (Brain.pointers.size === 2) {
+      Brain.dragNode = null; Brain.panStart = null;
+      const p = [...Brain.pointers.values()];
+      Brain.pinchD = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+    }
+    wakeBrain();
+  });
+  cv.addEventListener("pointermove", (e) => {
+    if (!Brain.pointers.has(e.pointerId)) return;
+    const prev = Brain.pointers.get(e.pointerId);
+    Brain.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (Brain.downXY && Math.hypot(e.clientX - Brain.downXY.x, e.clientY - Brain.downXY.y) > 8) Brain.movedFar = true;
+    if (Brain.pointers.size === 2) {
+      const p = [...Brain.pointers.values()];
+      const d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+      if (Brain.pinchD > 0) {
+        const mx = (p[0].x + p[1].x) / 2, my = (p[0].y + p[1].y) / 2;
+        brainZoomAt(mx, my, d / Brain.pinchD);
+      }
+      Brain.pinchD = d;
+      return;
+    }
+    if (Brain.dragNode) {
+      const w = brainToWorld(e.clientX, e.clientY);
+      Brain.dragNode.x = w.x; Brain.dragNode.y = w.y;
+      Brain.dragNode.vx = Brain.dragNode.vy = 0;
+    } else if (Brain.panStart) {
+      Brain.ox = e.clientX - Brain.panStart.x;
+      Brain.oy = e.clientY - Brain.panStart.y;
+    }
+    wakeBrain();
+  });
+  const endPointer = (e) => {
+    const wasTap = Brain.pointers.size === 1 && !Brain.movedFar && (Date.now() - Brain.downAt) < 500;
+    const n = wasTap ? brainHit(e.clientX, e.clientY) : null;
+    Brain.pointers.delete(e.pointerId);
+    if (Brain.pointers.size < 2) Brain.pinchD = 0;
+    if (Brain.pointers.size === 0) {
+      if (Brain.dragNode) {
+        Brain.posMemory.set(Brain.dragNode.id, { x: Brain.dragNode.x, y: Brain.dragNode.y });
+        Brain.dragNode = null;
+      }
+      Brain.panStart = null;
+      if (n) openNodeSheet(n);
+    }
+  };
+  cv.addEventListener("pointerup", endPointer);
+  cv.addEventListener("pointercancel", endPointer);
+  cv.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    brainZoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.12 : 0.89);
+    wakeBrain();
+  }, { passive: false });
+}
+
+function brainResize() {
+  if (!Brain.ready) return;
+  const wrap = Brain.canvas.parentElement;
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  if (!w || !h) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  Brain.canvas.width = w * dpr;
+  Brain.canvas.height = h * dpr;
+  Brain._dpr = dpr;
+  Brain.cx = w / 2; Brain.cy = h / 2;
+}
+
+function brainToWorld(sx, sy) {
+  const r = Brain.canvas.getBoundingClientRect();
+  const x = sx - r.left, y = sy - r.top;
+  return {
+    x: (x - r.width / 2 - Brain.ox) / Brain.scale + Brain.cx,
+    y: (y - r.height / 2 - Brain.oy) / Brain.scale + Brain.cy,
+  };
+}
+
+function brainHit(cx, cy) {
+  const w = brainToWorld(cx, cy);
+  for (let i = Brain.nodes.length - 1; i >= 0; i--) {
+    const n = Brain.nodes[i];
+    if (Math.hypot(n.x - w.x, n.y - w.y) <= n.r + 10) return n;
+  }
+  return null;
+}
+
+function brainZoomAt(vx, vy, factor) {
+  // vx, vy = viewport (client) coordinates
+  const before = brainToWorld(vx, vy);
+  Brain.scale = Math.min(3.2, Math.max(0.35, Brain.scale * factor));
+  const r = Brain.canvas.getBoundingClientRect();
+  const x = vx - r.left, y = vy - r.top;
+  Brain.ox = x - r.width / 2 - (before.x - Brain.cx) * Brain.scale;
+  Brain.oy = y - r.height / 2 - (before.y - Brain.cy) * Brain.scale;
+}
+
+function initBrainGraph(data) {
+  for (const n of Brain.nodes) {
+    if (Brain.posMemory.size > 600) Brain.posMemory.clear();
+    Brain.posMemory.set(n.id, { x: n.x, y: n.y });
+  }
+  const w = Brain.canvas.clientWidth || 360, h = Brain.canvas.clientHeight || 480;
+  Brain.cx = w / 2; Brain.cy = h / 2;
+  const R = Math.min(w, h) * 0.36;
+  Brain.nodes = data.nodes.map((n, i) => {
+    const saved = Brain.posMemory.get(n.id);
+    const a = (i / Math.max(1, data.nodes.length)) * Math.PI * 2;
+    return {
+      ...n,
+      x: saved ? saved.x : Brain.cx + Math.cos(a) * R * (0.35 + Math.random() * 0.65),
+      y: saved ? saved.y : Brain.cy + Math.sin(a) * R * (0.35 + Math.random() * 0.65),
+      vx: 0, vy: 0,
+      r: n.kind === "agent" ? 26 : n.kind === "file" ? 15 : n.kind === "chunk" ? 8 : 11,
+    };
+  });
+  const idx = new Map(Brain.nodes.map((n, i) => [n.id, i]));
+  Brain.edgeIdx = data.edges
+    .map(([a, b]) => [idx.get(a), idx.get(b)])
+    .filter(([a, b]) => a !== undefined && b !== undefined);
+  Brain.still = 0;
+  $("brain-empty").classList.toggle("hidden", data.nodes.length > 1);
+  startBrainLoop();
+}
+
+function brainTick() {
+  const nodes = Brain.nodes;
+  const n = nodes.length;
+  for (let i = 0; i < n; i++) {
+    const a = nodes[i];
+    for (let j = i + 1; j < n; j++) {
+      const b = nodes[j];
+      let dx = a.x - b.x, dy = a.y - b.y;
+      let d2 = dx * dx + dy * dy;
+      if (d2 < 4) { dx = (Math.random() - 0.5) * 2; dy = (Math.random() - 0.5) * 2; d2 = 4; }
+      const d = Math.sqrt(d2);
+      const f = Math.min(11000 / d2, 60);
+      const fx = (dx / d) * f, fy = (dy / d) * f;
+      a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+    }
+  }
+  for (const [ai, bi] of Brain.edgeIdx) {
+    const a = nodes[ai], b = nodes[bi];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const d = Math.hypot(dx, dy) || 1;
+    const f = ((d - 95) * 0.018);
+    const fx = (dx / d) * f, fy = (dy / d) * f;
+    a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+  }
+  for (const nd of nodes) {
+    if (nd === Brain.dragNode) continue;
+    nd.vx += (Brain.cx - nd.x) * 0.0035;
+    nd.vy += (Brain.cy - nd.y) * 0.0035;
+    nd.vx *= 0.86; nd.vy *= 0.86;
+    nd.x += nd.vx; nd.y += nd.vy;
+  }
+}
+
+function brainDraw(t) {
+  const { ctx, canvas } = Brain;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const dpr = Brain._dpr || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const g = ctx.createRadialGradient(w / 2, h / 2, 30, w / 2, h / 2, Math.max(w, h) * 0.8);
+  g.addColorStop(0, "#10163a");
+  g.addColorStop(1, "#070a18");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+  ctx.fillStyle = "#fff";
+  for (const s of Brain.stars) {
+    ctx.globalAlpha = s.a;
+    ctx.fillRect(s.x * w, s.y * h, s.r, s.r);
+  }
+  ctx.globalAlpha = 1;
+  ctx.save();
+  ctx.translate(w / 2 + Brain.ox, h / 2 + Brain.oy);
+  ctx.scale(Brain.scale, Brain.scale);
+  ctx.translate(-Brain.cx, -Brain.cy);
+  // edges
+  ctx.lineWidth = 1 / Brain.scale;
+  for (const [ai, bi] of Brain.edgeIdx) {
+    const a = Brain.nodes[ai], b = Brain.nodes[bi];
+    const col = KIND_COLORS[b.kind] || "#8892b8";
+    ctx.strokeStyle = col;
+    ctx.globalAlpha = 0.34;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  // nodes
+  const pulse = (Math.sin((t || 0) / 450) + 1) / 2;
+  for (const nd of Brain.nodes) {
+    const col = KIND_COLORS[nd.kind] || "#cbd5e1";
+    ctx.shadowColor = col;
+    ctx.shadowBlur = nd.kind === "agent" ? 26 + pulse * 14 : 12;
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.arc(nd.x, nd.y, nd.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#0b0e1f";
+    ctx.beginPath();
+    ctx.arc(nd.x, nd.y, nd.r * 0.62, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.font = `${Math.round(nd.r * 0.95)}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(nd.icon, nd.x, nd.y + 1);
+    if (Brain.scale > 0.5 || nd.kind === "agent") {
+      ctx.font = `600 ${nd.kind === "agent" ? 15 : 11}px Tahoma, sans-serif`;
+      ctx.fillStyle = "rgba(255,255,255,.92)";
+      ctx.shadowColor = "rgba(0,0,0,.8)";
+      ctx.shadowBlur = 4;
+      ctx.fillText(nd.label, nd.x, nd.y + nd.r + 11);
+      ctx.shadowBlur = 0;
+    }
+  }
+  ctx.restore();
+}
+
+function startBrainLoop() {
+  if (Brain.running || !Brain.nodes.length) return;
+  Brain.running = true;
+  const step = (t) => {
+    if (!Brain.running) return;
+    brainTick();
+    brainDraw(t || 0);
+    let maxV = 0;
+    for (const nd of Brain.nodes) maxV = Math.max(maxV, Math.abs(nd.vx) + Math.abs(nd.vy));
+    if (maxV < 0.03 && !Brain.dragNode) {
+      if (++Brain.still > 80) { Brain.running = false; return; }
+    } else Brain.still = 0;
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+function wakeBrain() { Brain.still = 0; startBrainLoop(); }
+
+function openNodeSheet(n) {
+  openSheet(`
+    <h2>${escapeHtml(n.icon)} ${escapeHtml(n.label)}</h2>
+    <p><span class="bstat"><b>◉</b> ${KIND_AR[n.kind] || n.kind}</span></p>
+    <p style="font-size:15px;line-height:1.9;white-space:pre-wrap">${escapeHtml(n.detail || "لا تفاصيل إضافية.")}</p>`);
+}
+
+async function loadBrain(soft = false) {
+  const id = $("brain-agent") && $("brain-agent").value;
+  if (!id) return;
+  try {
+    const data = await api(`/api/brain/${id}`);
+    initBrainGraph(data);
+    updateBrainStats(data);
+    const agent = state.agents.find((a) => a.id === id);
+    const sw = $("autolearn-toggle");
+    sw.classList.toggle("on", !!agent?.autoLearn);
+    sw.setAttribute("aria-checked", !!agent?.autoLearn);
+  } catch (e) {
+    if (!soft) toast(errText(e), true);
+  }
+}
+
+function updateBrainStats(data) {
+  const s = data.stats;
+  const names = { memory: "🧠 ذاكرة", lesson: "💡 دروس", file: "📄 ملفات", tool: "🔧 أدوات", skill: "🧩 مهارات", event: "✨ أحداث" };
+  let html = `<span class="bstat live"><span class="dot"></span>مباشر</span><span class="bstat"><b>${s.total}</b> عقدة</span>`;
+  for (const [k, label] of Object.entries(names)) {
+    if (s.counts[k]) html += `<span class="bstat"><b>${s.counts[k]}</b> ${label}</span>`;
+  }
+  if (s.lastEvent) {
+    const d = new Date(s.lastEvent);
+    html += `<span class="bstat">⏱️ آخر تعلّم: ${d.toLocaleDateString("ar")} ${d.toLocaleTimeString("ar", { hour: "2-digit", minute: "2-digit" })}</span>`;
+  }
+  $("brain-stats").innerHTML = html;
+}
+
 /* ---------- Image studio ---------- */
 
 const IMG_STYLES = [
@@ -598,6 +984,94 @@ function initImageStudio() {
   };
 }
 
+/* ---------- Skills library ---------- */
+
+const SKILL_PRESETS = [
+  { name: "خبير تسويق رقمي", icon: "📣", instructions: "أنت خبير تسويق رقمي محترف. عند أي سؤال تسويقي: ابدأ بفهم الجمهور المستهدف، اقترح 3 أفكار عملية قابلة للتنفيذ خلال أسبوع، اذكر مقياس نجاح واضحاً لكل فكرة، وتجنب النصائح العامة الفارغة." },
+  { name: "مبرمج أول", icon: "💻", instructions: "أنت مبرمج أول خبير. اكتب كوداً نظيفاً يعمل من أول مرة، اشرح الفكرة باختصار قبل الكود، علّق على الأجزاء المعقدة فقط، واذكر الحالات الحدّية والأخطاء المحتملة وكيفية اختبارها." },
+  { name: "كاتب محتوى عربي", icon: "✍️", instructions: "أنت كاتب محتوى عربي محترف. اكتب بلغة حية ومباشرة، ابدأ بخطاف قوي يجذب القارئ، استخدم فقرات قصيرة وعناوين فرعية، واختم بدعوة لاتخاذ إجراء. تجنب الحشو والكليشيهات والمقدمات الطويلة." },
+  { name: "مترجم محترف", icon: "🌐", instructions: "أنت مترجم محترف. ترجم المعنى والروح لا الكلمات حرفياً، حافظ على نبرة النص الأصلي، وكيّف الأمثلة والتعابير الاصطلاحية لتناسب الثقافة العربية. عند الغموض اذكر البديلين باختصار." },
+  { name: "محلل بيانات", icon: "📊", instructions: "أنت محلل بيانات. عند عرض أرقام: لخّص الاتجاه الرئيسي في سطر واحد أولاً، اذكر أهم 3 ملاحظات، اقترح قراراً عملياً واحداً مبنياً عليها، ونبّه لأي رقم يحتاج تحققاً قبل الاعتماد عليه." },
+];
+
+async function loadSkills() {
+  const box = $("skills-list");
+  box.innerHTML = '<div class="skel"></div>';
+  try {
+    const { skills } = await api("/api/skills");
+    skillsCache = skills;
+    box.innerHTML = skills.length ? "" : '<p class="muted">لا مهارات بعد — أنشئ واحدة أو أضف الجاهزة ✨</p>';
+    for (const s of skills) {
+      const d = document.createElement("div");
+      d.className = "card agent-row";
+      d.innerHTML = `<div class="av">${escapeHtml(s.icon)}</div>
+        <div><div class="nm">${escapeHtml(s.name)}</div>
+        <div class="ds">${escapeHtml((s.instructions || "").slice(0, 90))}…</div></div>
+        <div class="spacer"></div>
+        <button class="btn icon-btn" data-act="view" title="عرض">👁️</button>
+        <button class="btn icon-btn" data-act="del" title="حذف">🗑️</button>`;
+      const [viewB, delB] = d.querySelectorAll("button");
+      viewB.onclick = () => openSheet(`
+        <h2>${escapeHtml(s.icon)} ${escapeHtml(s.name)}</h2>
+        <p style="font-size:15px;line-height:1.9;white-space:pre-wrap">${escapeHtml(s.instructions)}</p>`);
+      delB.onclick = async () => {
+        if (await confirmDialog("حذف المهارة", `حذف "${s.name}" نهائياً؟`, "حذف")) {
+          try {
+            await api(`/api/skills/${s.id}`, { method: "DELETE" });
+            skillsCache = null;
+            toast("تم حذف المهارة");
+            loadSkills();
+          } catch (e) { toast(errText(e), true); }
+        }
+      };
+      box.appendChild(d);
+    }
+  } catch (e) { box.innerHTML = `<div class="note err">${escapeHtml(errText(e))}</div>`; }
+}
+
+function initSkillsUI() {
+  $("btn-skill-open").onclick = () => {
+    openSheet(`
+      <h2>🧩 مهارة جديدة</h2>
+      <p class="muted">المهارة حزمة تعليمات تُدمج في عقل الوكيل عندما تفعّلها له.</p>
+      <input id="sk-name" placeholder="اسم المهارة (مثال: خبير SEO)">
+      <div class="row"><input id="sk-icon" placeholder="🧩" value="🧩" style="flex:0 0 80px;text-align:center;font-size:22px"></div>
+      <textarea id="sk-ins" rows="5" placeholder="تعليمات المهارة — كيف يتصرف الوكيل عندما تُفعّل؟ اكتب بتفصيل عملي وواضح"></textarea>
+      <button class="btn primary big" id="sk-save">💾 حفظ المهارة</button>`);
+    $("sk-save").onclick = async () => {
+      const name = $("sk-name").value.trim();
+      const ins = $("sk-ins").value.trim();
+      if (!name || !ins) return toast("الاسم والتعليمات مطلوبان", true);
+      try {
+        await api("/api/skills", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name, icon: $("sk-icon").value.trim() || "🧩", instructions: ins }),
+        });
+        skillsCache = null;
+        closeSheet();
+        toast("تمت إضافة المهارة ✅");
+        loadSkills();
+      } catch (e) { toast(errText(e), true); }
+    };
+  };
+  $("btn-skill-presets").onclick = async () => {
+    const btn = $("btn-skill-presets");
+    btn.disabled = true;
+    try {
+      for (const p of SKILL_PRESETS) {
+        await api("/api/skills", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify(p),
+        });
+      }
+      skillsCache = null;
+      toast(`تمت إضافة ${SKILL_PRESETS.length} مهارات جاهزة ✨`);
+      loadSkills();
+    } catch (e) { toast(errText(e), true); }
+    btn.disabled = false;
+  };
+}
+
 /* ---------- Dashboard ---------- */
 async function loadDashboard() {
   const cards = $("dash-cards");
@@ -617,7 +1091,7 @@ async function loadDashboard() {
       <div class="card"><h3>⚡ خلايا اليوم</h3><b style="font-size:26px">${s.today.neurons.toLocaleString("ar")}</b></div>`;
     drawChart(s.series);
   } catch (e) { cards.innerHTML = `<div class="note err">${escapeHtml(errText(e))}</div>`; }
-  loadLearnLog(); loadKnowledge(); loadTools(); loadReminders();
+  loadLearnLog(); loadKnowledge(); loadTools(); loadReminders(); loadSkills();
 }
 
 function drawChart(series) {
@@ -794,6 +1268,7 @@ $("btn-save-pw").onclick = () => {
 /* ---------- Init ---------- */
 (async function init() {
   renderSuggestions();
+  initSkillsUI();
   try {
     state.config = await api("/api/config");
     initImageStudio();
