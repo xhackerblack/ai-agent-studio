@@ -27,9 +27,15 @@ function mockEnv(aiRun) {
       async get(k, t) {
         const v = this._m.get(k);
         if (v === undefined) return null;
+        if (t === "arrayBuffer") {
+          if (v instanceof Uint8Array) return v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength);
+          return new TextEncoder().encode(String(v)).buffer;
+        }
         return t === "json" ? JSON.parse(v) : v;
       },
-      async put(k, v) { this._m.set(k, typeof v === "string" ? v : JSON.stringify(v)); },
+      async put(k, v) {
+        this._m.set(k, v instanceof Uint8Array ? v : (typeof v === "string" ? v : JSON.stringify(v)));
+      },
       async delete(k) { this._m.delete(k); },
     },
     ASSETS: { fetch: async () => new Response("asset", { status: 200 }) },
@@ -315,4 +321,56 @@ test("learn helpers: transcript truncates", () => {
   const t = transcriptFor(msgs);
   assert.ok(t.length <= 6000);
   assert.ok(t.includes("المستخدم:"));
+});
+
+/* ---------- image generation ---------- */
+
+function imageEnv() {
+  return mockEnv(async (model, args) => {
+    assert.ok(String(model).includes("flux") || String(model).includes("dreamshaper"));
+    assert.ok(args.prompt && args.prompt.length > 0);
+    // FLUX returns base64 JSON
+    return { image: Buffer.from("fake-png-bytes").toString("base64") };
+  });
+}
+
+test("config exposes image models", async () => {
+  const env = mockEnv(async () => ({}));
+  const c = await (await api(env, "/api/config")).json();
+  assert.ok(Array.isArray(c.imageModels) && c.imageModels.length >= 2);
+  assert.ok(c.defaultImageModel.includes("flux"));
+});
+
+test("image_generate builtin tool is registered", () => {
+  const t = getBuiltinTool("image_generate");
+  assert.ok(t && t.label === "توليد صورة");
+  assert.ok(typeof t.run === "function");
+});
+
+test("POST /api/generate-image stores PNG and serves it", async () => {
+  const env = imageEnv();
+  const res = await postJson(env, "/api/generate-image", { prompt: "a red apple" });
+  assert.equal(res.status, 201);
+  const { id, url } = await res.json();
+  assert.ok(/^[0-9a-f-]{36}$/.test(id));
+  assert.equal(url, `/api/images/${id}`);
+  const img = await api(env, url);
+  assert.equal(img.status, 200);
+  assert.equal(img.headers.get("content-type"), "image/png");
+  const buf = Buffer.from(await img.arrayBuffer());
+  assert.equal(buf.toString(), "fake-png-bytes");
+  const s = await (await api(env, "/api/dashboard/stats")).json();
+  assert.equal(s.today.images, 1);
+});
+
+test("POST /api/generate-image rejects empty prompt", async () => {
+  const env = imageEnv();
+  const res = await postJson(env, "/api/generate-image", { prompt: "  " });
+  assert.equal(res.status, 400);
+});
+
+test("GET /api/images/:bad-id returns 404", async () => {
+  const env = imageEnv();
+  assert.equal((await api(env, "/api/images/nope")).status, 404);
+  assert.equal((await api(env, "/api/images/123")).status, 404);
 });
