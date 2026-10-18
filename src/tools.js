@@ -137,6 +137,19 @@ export const BUILTIN_TOOLS = [
       return { saved: true, reminder: item };
     },
   },
+  {
+    name: "image_generate",
+    label: "توليد صورة",
+    icon: "🎨",
+    description: "يولّد صورة حقيقية من وصف نصي (نموذج FLUX). الوسائط: {prompt} — صف الصورة بالإنجليزية لأفضل نتيجة، مثال: {prompt: \"a cozy bakery at sunrise, warm light\"}",
+    async run(args, ctx) {
+      const prompt = String(args.prompt || "").trim();
+      if (!prompt) throw new Error("وصف الصورة (prompt) مطلوب");
+      if (!ctx.generateImage) throw new Error("توليد الصور غير متاح في هذا السياق");
+      const { id, url } = await ctx.generateImage(prompt);
+      return { id, url, note: "تم توليد الصورة وحفظها — أخبر المستخدم أنها جاهزة بالأسفل" };
+    },
+  },
 ];
 
 export function getBuiltinTool(name) {
