@@ -1,7 +1,8 @@
 // AI Agent Studio — Cloudflare Worker.
 // Routes: /api/config, /api/agents*, /api/conversations*, /api/chat (SSE),
 // /api/train, /api/knowledge*, /api/learn, /api/learning-log/*, /api/memories*,
-// /api/tools*, /api/reminders*, /api/dashboard/stats.
+// /api/tools*, /api/skills*, /api/brain/*, /api/reminders*, /api/dashboard/stats,
+// /api/generate-image, /api/images/*.
 // Static frontend served from ./public via the ASSETS binding.
 
 import {
@@ -139,6 +140,10 @@ async function handleAgentById(req, kvH, id) {
     if (Array.isArray(body.tools)) {
       agent.tools = body.tools.filter((t) => getBuiltinTool(t)).slice(0, 8);
     }
+    if (Array.isArray(body.skillIds)) {
+      agent.skillIds = body.skillIds.map(String).slice(0, 12);
+    }
+    if (typeof body.autoLearn === "boolean") agent.autoLearn = body.autoLearn;
     if (typeof body.isActive === "boolean") agent.isActive = body.isActive;
     await saveAgent(kvH, agent);
     return json({ agent });
@@ -269,7 +274,7 @@ async function decideTool(env, agent, enabledTools, userText) {
   return null;
 }
 
-function buildSystemPrompt(agent, memories, learned, ragContext) {
+function buildSystemPrompt(agent, memories, learned, ragContext, skills) {
   const parts = [agent.systemPrompt];
   const memEntries = Object.entries(memories || {});
   if (memEntries.length) {
@@ -282,6 +287,10 @@ function buildSystemPrompt(agent, memories, learned, ragContext) {
   }
   if (ragContext) {
     parts.push("معلومات من ملفات التدريب الخاصة بك (اعتمد عليها وأشر للمصدر):\n" + ragContext);
+  }
+  if (skills && skills.length) {
+    parts.push("مهارات مدمجة — طبّقها باحتراف كلما كان ذلك مفيداً:\n" +
+      skills.map((s) => `### ${s.icon || "🧩"} ${s.name}\n${s.instructions}`).join("\n"));
   }
   parts.push("لغة الرد: " + (agent.language || "العربية") + ". النبرة: " + (agent.tone || "ودود ومختصر") + ".");
   return parts.join("\n\n");
@@ -305,7 +314,7 @@ async function getRagContext(env, kvH, agent, userText) {
   return hits.map((h, i) => `[${i + 1}] (من ${h.file || "ملف التدريب"}): ${h.text}`).join("\n");
 }
 
-async function handleChat(req, env, kvH) {
+async function handleChat(req, env, kvH, waitCtx) {
   const body = await req.json().catch(() => ({}));
   const agent = await getAgent(kvH, String(body.agentId || ""));
   if (!agent || !agent.isActive) {
@@ -331,9 +340,10 @@ async function handleChat(req, env, kvH) {
       try {
         send({ type: "conversation", id: conv.id, title: conv.title });
 
-        const [memories, learned] = await Promise.all([
+        const [memories, learned, skills] = await Promise.all([
           kvH.get(`mem:${agent.id}`),
           kvH.get(`learned:${agent.id}`),
+          getSkillsForAgent(kvH, agent),
         ]);
         let ragContext = "";
         try {
@@ -374,7 +384,7 @@ async function handleChat(req, env, kvH) {
         }
 
         // Phase 2: stream the final answer
-        const system = buildSystemPrompt(agent, memories, learned, ragContext);
+        const system = buildSystemPrompt(agent, memories, learned, ragContext, skills);
         const history = (conv.messages || []).slice(-12).map((m) => ({
           role: m.role === "user" ? "user" : "assistant", content: m.content,
         }));
@@ -429,6 +439,19 @@ async function handleChat(req, env, kvH) {
 
         send({ type: "done", tools: toolsUsed, images: imageIds });
         controller.close();
+
+        // Self-learning autopilot: if enabled, learn from this conversation
+        // in the background after the response is delivered.
+        if (agent.autoLearn && waitCtx && typeof waitCtx.waitUntil === "function") {
+          waitCtx.waitUntil((async () => {
+            try {
+              const r = await learnFromConversation(env, kvH, agent, conv.messages);
+              if (!r.skipped) {
+                await bumpStat(kvH, "neurons", chatNeurons(agent.model, 4000, 1200));
+              }
+            } catch { /* silent: learning must never break chat */ }
+          })());
+        }
       } catch (e) {
         if (isQuotaError(e)) send({ type: "error", code: "quota" });
         else send({ type: "error", code: "upstream", detail: errDetail(e) });
@@ -567,6 +590,124 @@ async function handleLearn(req, env, kvH) {
   }
 }
 
+/* ---------------- skills ---------------- */
+
+async function listSkills(kvH) {
+  const ids = (await kvH.get("skills:index")) || [];
+  const out = [];
+  for (const id of ids) {
+    const s = await kvH.get(`skill:${id}`);
+    if (s) out.push(s);
+  }
+  return out;
+}
+
+async function getSkillsForAgent(kvH, agent) {
+  const ids = agent.skillIds || [];
+  if (!ids.length) return [];
+  const out = [];
+  for (const id of ids) {
+    const s = await kvH.get(`skill:${id}`);
+    if (s) out.push(s);
+  }
+  return out;
+}
+
+async function handleSkills(req, kvH) {
+  if (req.method === "GET") return json({ skills: await listSkills(kvH) });
+  if (req.method === "POST") {
+    const body = await req.json().catch(() => ({}));
+    const name = String(body.name || "").trim().slice(0, 60);
+    const instructions = String(body.instructions || "").trim().slice(0, 4000);
+    if (!name || !instructions) {
+      return json({ code: "bad", message: "الاسم والتعليمات مطلوبان" }, 400);
+    }
+    const skill = {
+      id: "sk_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+      name,
+      icon: String(body.icon || "🧩").slice(0, 8),
+      instructions,
+      createdAt: new Date().toISOString(),
+    };
+    await kvH.set(`skill:${skill.id}`, skill);
+    const ids = (await kvH.get("skills:index")) || [];
+    ids.unshift(skill.id);
+    await kvH.set("skills:index", ids.slice(0, 100));
+    return json({ skill }, 201);
+  }
+  return json({ code: "method", message: "Method not allowed" }, 405);
+}
+
+/* ---------------- brain (live knowledge graph) ---------------- */
+
+async function handleBrain(kvH, agentId) {
+  const agent = await getAgent(kvH, String(agentId || ""));
+  if (!agent) return json({ code: "not-found", message: "الوكيل غير موجود" }, 404);
+  const nodes = [];
+  const edges = [];
+  const add = (id, label, kind, icon, detail) => nodes.push({
+    id, label: String(label || "").slice(0, 60), kind,
+    icon: String(icon || "•").slice(0, 8), detail: String(detail || "").slice(0, 400),
+  });
+  const link = (a, b) => edges.push([a, b]);
+  const A = "agent";
+  add(A, agent.name, "agent", agent.avatar || "🤖", agent.description || agent.tone || "");
+  let i = 0;
+  const memories = (await kvH.get(`mem:${agent.id}`)) || {};
+  for (const [k, v] of Object.entries(memories).slice(0, 25)) {
+    const id = `mem${i++}`;
+    add(id, k, "memory", "🧠", `${k}: ${v}`);
+    link(A, id);
+  }
+  const learned = (await kvH.get(`learned:${agent.id}`)) || [];
+  for (const l of learned.slice(-20)) {
+    const id = `les${i++}`;
+    add(id, (l.text || "").slice(0, 42), "lesson", "💡", l.text);
+    link(A, id);
+  }
+  const files = (await kvH.get(`know:${agent.id}:files`)) || [];
+  for (const f of files.slice(0, 10)) {
+    const fid = `file${i++}`;
+    add(fid, f.filename, "file", "📄", `${f.chunks || 0} مقطعاً معرفياً`);
+    link(A, fid);
+    const rec = await kvH.get(`know:${agent.id}:${f.id}`);
+    for (const c of ((rec && rec.chunks) || []).slice(0, 5)) {
+      const cid = `chk${i++}`;
+      add(cid, (c.text || "").slice(0, 38), "chunk", "📝", c.text);
+      link(fid, cid);
+    }
+  }
+  for (const tname of (agent.tools || [])) {
+    const t = getBuiltinTool(tname);
+    if (!t) continue;
+    const id = `tool${i++}`;
+    add(id, t.label, "tool", t.icon, t.description);
+    link(A, id);
+  }
+  for (const s of await getSkillsForAgent(kvH, agent)) {
+    const id = `sk${i++}`;
+    add(id, s.name, "skill", s.icon, (s.instructions || "").slice(0, 200));
+    link(A, id);
+  }
+  const log = (await kvH.get(`learn:${agent.id}`)) || [];
+  const evIcon = { memory: "🧠", lesson: "💡", gap: "❓", training: "📄" };
+  for (const e of log.slice(-12)) {
+    const id = `ev${i++}`;
+    add(id, (e.detail || "").slice(0, 42), "event", evIcon[e.event] || "✨", e.detail);
+    link(A, id);
+  }
+  const counts = {};
+  for (const n of nodes) counts[n.kind] = (counts[n.kind] || 0) + 1;
+  return json({
+    nodes, edges,
+    stats: {
+      total: nodes.length, edges: edges.length, counts,
+      autoLearn: !!agent.autoLearn,
+      lastEvent: log.length ? log[log.length - 1].at : null,
+    },
+  });
+}
+
 /* ---------------- tools ---------------- */
 
 async function handleTools(req, kvH) {
@@ -698,7 +839,7 @@ export default {
         return json({ ok: true });
       }
 
-      if (path === "/api/chat" && request.method === "POST") return handleChat(request, env, kvH);
+      if (path === "/api/chat" && request.method === "POST") return handleChat(request, env, kvH, ctx);
 
       if (path === "/api/train" && request.method === "POST") {
         try {
@@ -731,6 +872,16 @@ export default {
       }
 
       if (path === "/api/tools") return handleTools(request, kvH);
+      if (path === "/api/skills") return handleSkills(request, kvH);
+      m = path.match(/^\/api\/skills\/([^/]+)$/);
+      if (m && request.method === "DELETE") {
+        await kvH.del(`skill:${m[1]}`);
+        const ids = ((await kvH.get("skills:index")) || []).filter((x) => x !== m[1]);
+        await kvH.set("skills:index", ids);
+        return json({ ok: true });
+      }
+      m = path.match(/^\/api\/brain\/([^/]+)$/);
+      if (m && request.method === "GET") return handleBrain(kvH, m[1]);
       m = path.match(/^\/api\/tools\/([^/]+)$/);
       if (m && request.method === "DELETE") {
         await kvH.del(`tool:${m[1]}`);
