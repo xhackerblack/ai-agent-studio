@@ -374,3 +374,74 @@ test("GET /api/images/:bad-id returns 404", async () => {
   assert.equal((await api(env, "/api/images/nope")).status, 404);
   assert.equal((await api(env, "/api/images/123")).status, 404);
 });
+
+/* ---------- skills + brain ---------- */
+
+test("skills CRUD", async () => {
+  const env = mockEnv(async () => ({}));
+  const bad = await postJson(env, "/api/skills", { name: "x" });
+  assert.equal(bad.status, 400);
+  const created = await postJson(env, "/api/skills", { name: "مهارة", instructions: "افعل كذا", icon: "🧪" });
+  assert.equal(created.status, 201);
+  const { skill } = await created.json();
+  const listed = await (await api(env, "/api/skills")).json();
+  assert.ok(listed.skills.some((s) => s.id === skill.id));
+  const del = await api(env, `/api/skills/${skill.id}`, { method: "DELETE" });
+  assert.equal(del.status, 200);
+  const listed2 = await (await api(env, "/api/skills")).json();
+  assert.ok(!listed2.skills.some((s) => s.id === skill.id));
+});
+
+test("agent PATCH persists skillIds and autoLearn", async () => {
+  const env = mockEnv(async () => ({}));
+  const { agent } = await (await postJson(env, "/api/agents", { name: "A" })).json();
+  const { skill } = await (await postJson(env, "/api/skills", { name: "S", instructions: "I" })).json();
+  const patched = await (await api(env, `/api/agents/${agent.id}`, {
+    method: "PATCH", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ skillIds: [skill.id], autoLearn: true }),
+  })).json();
+  assert.deepEqual(patched.agent.skillIds, [skill.id]);
+  assert.equal(patched.agent.autoLearn, true);
+});
+
+test("chat system prompt includes enabled skill instructions", async () => {
+  let captured = "";
+  const env = mockEnv(async (model, input) => {
+    const sys = JSON.stringify(input.messages || []);
+    if (sys.includes("مخطط أدوات")) return { response: '{"answer":true}' };
+    captured = sys;
+    return { response: "ok" };
+  });
+  const { agent } = await (await postJson(env, "/api/agents", { name: "A" })).json();
+  const { skill } = await (await postJson(env, "/api/skills", { name: "مهارة الاختبار", instructions: "تعليمات سرية للاختبار 12345" })).json();
+  await api(env, `/api/agents/${agent.id}`, {
+    method: "PATCH", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ skillIds: [skill.id] }),
+  });
+  await (await postJson(env, "/api/chat", { agentId: agent.id, message: "مرحبا" })).text();
+  assert.ok(captured.includes("تعليمات سرية للاختبار 12345"));
+  assert.ok(captured.includes("مهارات مدمجة"));
+});
+
+test("brain endpoint returns live graph", async () => {
+  const env = mockEnv(async () => ({}));
+  const { agent } = await (await postJson(env, "/api/agents", { name: "عبقري" })).json();
+  const { skill } = await (await postJson(env, "/api/skills", { name: "S", instructions: "I" })).json();
+  await api(env, `/api/agents/${agent.id}`, {
+    method: "PATCH", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ skillIds: [skill.id], autoLearn: true }),
+  });
+  const res = await api(env, `/api/brain/${agent.id}`);
+  assert.equal(res.status, 200);
+  const g = await res.json();
+  assert.ok(g.nodes.length >= 2);
+  assert.equal(g.nodes[0].kind, "agent");
+  assert.equal(g.nodes[0].label, "عبقري");
+  assert.ok(g.nodes.some((n) => n.kind === "skill" && n.label === "S"));
+  assert.ok(g.nodes.some((n) => n.kind === "tool"));
+  assert.ok(g.edges.length >= 2);
+  assert.equal(g.stats.autoLearn, true);
+  assert.equal(g.stats.total, g.nodes.length);
+  const bad = await api(env, "/api/brain/nope");
+  assert.equal(bad.status, 404);
+});
