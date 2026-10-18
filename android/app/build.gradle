@@ -1,0 +1,41 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.aistudio.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.aistudio.app"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+        // Backend URL injected at build time:
+        def url = project.hasProperty("appUrl") ? project.property("appUrl") : "https://ai-agent-studio.example.workers.dev"
+        buildConfigField "String", "APP_URL", "\"" + url + "\""
+    }
+
+    buildTypes {
+        debug {
+            // Debug builds are signed with the SDK debug key — installable
+            // directly on a phone (allow "unknown sources").
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+    buildFeatures { buildConfig true }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+}
