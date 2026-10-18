@@ -2,33 +2,39 @@
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#1a1033">
-<title>استوديو وكلاء الذكاء الاصطناعي</title>
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>استوديو الوكلاء</title>
 <link rel="manifest" href="/manifest.json">
 <link rel="stylesheet" href="/styles.css">
-<link rel="icon" href="/icons/icon-192.png">
+<link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
 </head>
 <body>
-<header class="topbar">
-  <div class="brand">🤖 استوديو الوكلاء</div>
-  <div class="quota" id="quota-chip" title="الحصة اليومية">…</div>
+
+<!-- App bar -->
+<header class="appbar" id="appbar">
+  <div class="appbar-title" id="appbar-title">🏠 الرئيسية</div>
+  <div class="appbar-actions" id="appbar-actions"></div>
 </header>
 
 <main id="views">
   <!-- HOME -->
-  <section class="view active" id="view-home">
+  <section class="view active" id="view-home" data-title="🏠 الرئيسية">
     <div class="hero">
+      <div class="hero-emoji">🤖</div>
       <h1>ابنِ وكيل ذكاء اصطناعي خاص بك</h1>
       <p>صِفه بجملة واحدة، درّبه بملف واحد، وشاهده يتعلم بنفسه.</p>
       <button class="btn primary big" id="cta-create">✨ أنشئ وكيلك الأول</button>
     </div>
     <h2>إجراءات سريعة</h2>
     <div class="grid2">
-      <button class="card action" data-go="agents">🤖<span>وكلائي</span></button>
-      <button class="card action" data-go="chat">💬<span>محادثة</span></button>
-      <button class="card action" data-go="dashboard">📊<span>لوحة التحكم</span></button>
-      <button class="card action" data-go="settings">⚙️<span>الإعدادات</span></button>
+      <button class="card action" data-go="agents"><span class="ic">🤖</span><span class="lb">وكلائي</span></button>
+      <button class="card action" data-go="chat"><span class="ic">💬</span><span class="lb">محادثة</span></button>
+      <button class="card action" data-go="dashboard"><span class="ic">📊</span><span class="lb">لوحة التحكم</span></button>
+      <button class="card action" data-go="settings"><span class="ic">⚙️</span><span class="lb">الإعدادات</span></button>
     </div>
     <h2>كيف يعمل؟</h2>
     <ol class="steps">
@@ -39,43 +45,42 @@
   </section>
 
   <!-- AGENTS -->
-  <section class="view" id="view-agents">
-    <div class="row space">
-      <h1>وكلائي</h1>
-      <button class="btn primary" id="btn-new-agent">＋ جديد</button>
-    </div>
+  <section class="view" id="view-agents" data-title="🤖 الوكلاء">
     <div class="card">
-      <h3>✨ تخصيص سريع — صف ما تريد بجملة واحدة</h3>
+      <h3>✨ تخصيص سريع</h3>
+      <p class="muted">صف ما تريد بجملة واحدة:</p>
       <textarea id="quick-desc" rows="2" placeholder="مثال: وكيل خبير في أسعار الذهب يجيب باختصار"></textarea>
-      <button class="btn primary" id="btn-quick">ولّد الوكيل</button>
+      <button class="btn primary block" id="btn-quick">ولّد الوكيل</button>
       <div id="quick-result" class="hidden"></div>
     </div>
+    <h2>كل الوكلاء</h2>
     <div id="agents-list" class="stack"></div>
+    <div class="fab-space"></div>
   </section>
 
   <!-- CHAT -->
-  <section class="view" id="view-chat">
+  <section class="view view-chat" id="view-chat" data-title="💬 المحادثة">
     <div class="chat-top">
-      <select id="chat-agent"></select>
-      <button class="btn small" id="btn-new-conv">＋</button>
-      <select id="chat-conv"></select>
+      <select id="chat-agent" aria-label="الوكيل"></select>
+      <button class="btn icon-btn" id="btn-new-conv" title="محادثة جديدة">＋</button>
     </div>
+    <select id="chat-conv" class="conv-select" aria-label="المحادثة"></select>
     <div id="chat-log" class="chat-log"></div>
     <div id="chat-tools" class="chat-tools"></div>
-    <div class="chat-input">
-      <input id="chat-text" type="text" placeholder="اكتب رسالتك…" autocomplete="off">
-      <button class="btn primary" id="btn-send">إرسال</button>
+    <div id="chat-suggest" class="suggest-row"></div>
+    <div class="chat-inputbar">
+      <textarea id="chat-text" rows="1" placeholder="اكتب رسالتك…" autocomplete="off"></textarea>
+      <button class="btn send-btn" id="btn-send" aria-label="إرسال">➤</button>
     </div>
-    <div class="row">
-      <button class="btn small" id="btn-learn-now">🧠 اجعله يتعلم من هذه المحادثة</button>
+    <div class="row chat-quick-actions">
+      <button class="btn small" id="btn-learn-now">🧠 اجعله يتعلم</button>
       <button class="btn small" id="btn-train-open">📄 درّبه بملف</button>
     </div>
     <div id="learn-status" class="note hidden"></div>
   </section>
 
   <!-- DASHBOARD -->
-  <section class="view" id="view-dashboard">
-    <h1>لوحة التحكم</h1>
+  <section class="view" id="view-dashboard" data-title="📊 لوحة التحكم">
     <div class="grid2" id="dash-cards"></div>
     <div class="card">
       <h3>النشاط — آخر ٧ أيام</h3>
@@ -83,44 +88,37 @@
     </div>
     <div class="card">
       <h3>🧠 سجل التعلّم الذاتي</h3>
-      <select id="learn-agent"></select>
+      <select id="learn-agent" aria-label="وكيل السجل"></select>
       <div id="learn-log" class="timeline"></div>
     </div>
     <div class="card">
       <h3>🗂️ ملفات التدريب</h3>
-      <select id="know-agent"></select>
+      <select id="know-agent" aria-label="وكيل المعرفة"></select>
       <div id="know-list" class="stack"></div>
     </div>
     <div class="card">
       <h3>🧰 الأدوات</h3>
       <div id="tools-list" class="stack"></div>
-      <details>
-        <summary>＋ إضافة أداة مخصصة (API خارجي)</summary>
-        <input id="ct-name" placeholder="اسم الأداة">
-        <input id="ct-base" placeholder="https://api.example.com" dir="ltr">
-        <input id="ct-desc" placeholder="وصف قصير">
-        <button class="btn" id="btn-add-tool">حفظ الأداة</button>
-      </details>
+      <button class="btn block" id="btn-custom-tool-open">＋ أداة مخصصة (API خارجي)</button>
     </div>
     <div class="card">
       <h3>⏰ التذكيرات</h3>
-      <select id="rem-agent"></select>
+      <select id="rem-agent" aria-label="وكيل التذكيرات"></select>
       <div id="rem-list" class="stack"></div>
     </div>
   </section>
 
   <!-- SETTINGS -->
-  <section class="view" id="view-settings">
-    <h1>الإعدادات</h1>
+  <section class="view" id="view-settings" data-title="⚙️ الإعدادات">
     <div class="card">
-      <h3>🔐 كلمة مرور التطبيق (اختياري)</h3>
+      <h3>🔐 كلمة مرور التطبيق</h3>
       <p class="muted">إن عيّنتها على الخادم (APP_PASSWORD) أدخلها هنا لحفظها على هذا الجهاز.</p>
-      <input id="set-password" type="password" placeholder="كلمة المرور" dir="ltr">
-      <button class="btn" id="btn-save-pw">حفظ</button>
+      <input id="set-password" type="password" placeholder="كلمة المرور" dir="ltr" autocomplete="current-password">
+      <button class="btn block" id="btn-save-pw">حفظ على هذا الجهاز</button>
     </div>
     <div class="card">
       <h3>💾 الذاكرة الدائمة</h3>
-      <select id="mem-agent"></select>
+      <select id="mem-agent" aria-label="وكيل الذاكرة"></select>
       <div id="mem-list" class="stack"></div>
     </div>
     <div class="card">
@@ -128,47 +126,30 @@
       <p class="muted">استوديو وكلاء الذكاء الاصطناعي — يعمل بالكامل على Cloudflare (Workers AI + KV)، مجاني حتى ١٠٬٠٠٠ خلية عصبية يومياً.</p>
       <p class="muted">العقل: نموذج لغوي. التعلّم والذاكرة والتحسين: ذاتية وتعمل في الخلفية.</p>
     </div>
+    <div class="fab-space"></div>
   </section>
 </main>
 
-<!-- Agent editor modal -->
-<div id="agent-modal" class="modal hidden">
-  <div class="modal-body">
-    <h2 id="am-title">وكيل جديد</h2>
-    <input id="am-name" placeholder="الاسم">
-    <input id="am-avatar" placeholder="الأيقونة (إيموجي)">
-    <input id="am-desc" placeholder="وصف قصير">
-    <input id="am-tone" placeholder="النبرة (مثال: ودود ومختصر)">
-    <select id="am-model"></select>
-    <textarea id="am-prompt" rows="4" placeholder="تعليمات النظام"></textarea>
-    <div id="am-tools" class="chips"></div>
-    <div class="row">
-      <button class="btn primary" id="am-save">حفظ</button>
-      <button class="btn" id="am-cancel">إلغاء</button>
-    </div>
-  </div>
+<!-- Floating action button -->
+<button id="fab" class="fab hidden" aria-label="إجراء سريع">＋</button>
+
+<!-- Bottom sheet -->
+<div id="sheet-backdrop" class="sheet-backdrop hidden"></div>
+<div id="sheet" class="sheet hidden" role="dialog" aria-modal="true">
+  <div class="sheet-handle"></div>
+  <div id="sheet-content" class="sheet-content"></div>
 </div>
 
-<!-- Training modal -->
-<div id="train-modal" class="modal hidden">
-  <div class="modal-body">
-    <h2>📄 تدريب بملف واحد</h2>
-    <p class="muted">ارفع ملفاً (TXT / MD / CSV / JSON / HTML — وPDF تجريبياً) وسيتعلم منه الوكيل تلقائياً.</p>
-    <input type="file" id="train-file" accept=".txt,.md,.csv,.json,.html,.pdf">
-    <div class="row">
-      <button class="btn primary" id="btn-train-start">ابدأ التدريب</button>
-      <button class="btn" id="btn-train-cancel">إلغاء</button>
-    </div>
-    <div id="train-status" class="note hidden"></div>
-  </div>
-</div>
+<!-- Toast -->
+<div id="toast" class="toast hidden" role="status"></div>
 
-<nav class="bottomnav">
-  <button data-view="home" class="active">🏠<span>الرئيسية</span></button>
-  <button data-view="agents">🤖<span>الوكلاء</span></button>
-  <button data-view="chat">💬<span>المحادثة</span></button>
-  <button data-view="dashboard">📊<span>اللوحة</span></button>
-  <button data-view="settings">⚙️<span>الإعدادات</span></button>
+<!-- Bottom navigation -->
+<nav class="bottomnav" aria-label="التنقل">
+  <button data-view="home" class="active"><span class="nic">🏠</span><span>الرئيسية</span></button>
+  <button data-view="agents"><span class="nic">🤖</span><span>الوكلاء</span></button>
+  <button data-view="chat"><span class="nic">💬</span><span>المحادثة</span></button>
+  <button data-view="dashboard"><span class="nic">📊</span><span>اللوحة</span></button>
+  <button data-view="settings"><span class="nic">⚙️</span><span>الإعدادات</span></button>
 </nav>
 
 <script src="/app.js"></script>
