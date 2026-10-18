@@ -96,6 +96,26 @@
     <div class="fab-space"></div>
   </section>
 
+  <!-- BRAIN -->
+  <section class="view" id="view-brain" data-title="🧠 عقل الوكيل">
+    <div class="card brain-head">
+      <div class="row">
+        <select id="brain-agent" aria-label="الوكيل" style="flex:1;margin:0"></select>
+        <button class="btn icon-btn" id="btn-brain-refresh" title="تحديث حي">🔄</button>
+      </div>
+      <div class="brain-stats" id="brain-stats"></div>
+      <label class="switch-row">
+        <span>🧠 تعلّم ذاتي تلقائي <small class="muted">— يتعلم بعد كل محادثة وحده</small></span>
+        <button class="switch" id="autolearn-toggle" role="switch" aria-checked="false" aria-label="التعلم الذاتي التلقائي"></button>
+      </label>
+      <p class="muted" style="margin:8px 0 0;font-size:13px">اسحب للتحرك • قرّب بأصبعين • انقر أي عقدة لتفاصيلها • اسحب العقدة لتحريكها</p>
+    </div>
+    <div class="brain-wrap"><canvas id="brain-canvas"></canvas>
+      <div id="brain-empty" class="brain-empty hidden">لا بيانات بعد — تحدث مع الوكيل أو درّبه بملف لينمو عقله 🧠</div>
+    </div>
+    <div class="fab-space"></div>
+  </section>
+
   <!-- DASHBOARD -->
   <section class="view" id="view-dashboard" data-title="📊 لوحة التحكم">
     <div class="grid2" id="dash-cards"></div>
@@ -112,6 +132,15 @@
       <h3>🗂️ ملفات التدريب</h3>
       <select id="know-agent" aria-label="وكيل المعرفة"></select>
       <div id="know-list" class="stack"></div>
+    </div>
+    <div class="card">
+      <h3>🧩 مكتبة المهارات</h3>
+      <p class="muted">المهارات حزم تعليمات تُدمج في عقل الوكيل — فعّلها لكل وكيل من صفحة تعديله.</p>
+      <div id="skills-list" class="stack"></div>
+      <div class="row">
+        <button class="btn small" id="btn-skill-open" style="flex:1">＋ مهارة جديدة</button>
+        <button class="btn small" id="btn-skill-presets" style="flex:1">✨ إضافة الجاهزة</button>
+      </div>
     </div>
     <div class="card">
       <h3>🧰 الأدوات</h3>
@@ -166,6 +195,7 @@
   <button data-view="agents"><span class="nic">🤖</span><span>الوكلاء</span></button>
   <button data-view="chat"><span class="nic">💬</span><span>المحادثة</span></button>
   <button data-view="images"><span class="nic">🎨</span><span>الصور</span></button>
+  <button data-view="brain"><span class="nic">🧠</span><span>العقل</span></button>
   <button data-view="dashboard"><span class="nic">📊</span><span>اللوحة</span></button>
   <button data-view="settings"><span class="nic">⚙️</span><span>الإعدادات</span></button>
 </nav>
