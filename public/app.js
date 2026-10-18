@@ -1269,6 +1269,23 @@ $("btn-save-pw").onclick = () => {
 (async function init() {
   renderSuggestions();
   initSkillsUI();
+  // PWA: check for app updates and auto-apply them
+  if ("serviceWorker" in navigator) {
+    try {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (reg) {
+        reg.update().catch(() => {});
+        setInterval(() => reg.update().catch(() => {}), 30 * 60 * 1000);
+      }
+      let refreshing = false;
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (refreshing) return;
+        refreshing = true;
+        toast("✨ وصل تحديث جديد — جارٍ تحميل آخر نسخة…");
+        setTimeout(() => location.reload(), 1500);
+      });
+    } catch { /* ignore */ }
+  }
   try {
     state.config = await api("/api/config");
     initImageStudio();
