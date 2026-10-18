@@ -7,7 +7,8 @@
 import {
   CHAT_MODELS, CHAT_FALLBACK, DEFAULT_CHAT_MODEL, EMBEDDING_MODEL,
   FREE_NEURONS_PER_DAY, getChatModel, chatNeurons, embeddingNeurons,
-  publicModels,
+  publicModels, IMAGE_MODELS, DEFAULT_IMAGE_MODEL, getImageModel,
+  publicImageModels,
 } from "./models.js";
 import { chunkText, retrieve, relevantChunks, RELEVANCE_THRESHOLD } from "./rag.js";
 import { BUILTIN_TOOLS, getBuiltinTool, builtinToolCards } from "./tools.js";
@@ -95,6 +96,8 @@ async function handleConfig() {
   return json({
     models: publicModels(),
     defaultModel: DEFAULT_CHAT_MODEL,
+    imageModels: publicImageModels(),
+    defaultImageModel: DEFAULT_IMAGE_MODEL,
     freePerDay: FREE_NEURONS_PER_DAY,
     builtinTools: builtinToolCards(),
     app: "AI Agent Studio",
@@ -181,10 +184,67 @@ async function handleConversations(req, kvH, url) {
   return json({ code: "method", message: "Method not allowed" }, 405);
 }
 
+/* ---------------- image generation ---------------- */
+
+/**
+ * Generate an image with Workers AI, store the PNG bytes in KV,
+ * return an unguessable URL. Images expire after 30 days.
+ */
+async function generateImage(env, prompt, modelId) {
+  const model = getImageModel(modelId);
+  const clean = String(prompt || "").trim().slice(0, 2000);
+  if (!clean) throw new Error("الوصف فارغ");
+  const out = await env.AI.run(model.id, { prompt: clean, steps: 4 });
+  let bytes;
+  if (model.returns === "base64") {
+    const b64 = out?.image;
+    if (typeof b64 !== "string" || !b64.length) throw new Error("no image in model response");
+    const bin = atob(b64);
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  } else {
+    bytes = new Uint8Array(await new Response(out).arrayBuffer());
+  }
+  if (!bytes.length) throw new Error("empty image");
+  const id = crypto.randomUUID();
+  await env.STUDIO_KV.put(`img:${id}`, bytes, {
+    metadata: { prompt: clean.slice(0, 200), at: Date.now() },
+    expirationTtl: 60 * 60 * 24 * 30,
+  });
+  return { id, url: `/api/images/${id}` };
+}
+
+async function handleGenerateImage(request, env, kvH) {
+  const body = await request.json().catch(() => ({}));
+  const prompt = String(body.prompt || "").trim();
+  if (!prompt) return json({ code: "bad", message: "الوصف (prompt) مطلوب" }, 400);
+  try {
+    const { id, url } = await generateImage(env, prompt, body.model);
+    await bumpStat(kvH, "images");
+    return json({ id, url, model: getImageModel(body.model).id }, 201);
+  } catch (e) {
+    if (isQuotaError(e)) return json({ code: "quota", message: "نفدت الحصة اليومية" }, 429);
+    return json({ code: "upstream", message: "تعذّر توليد الصورة", detail: errDetail(e) }, 502);
+  }
+}
+
+async function handleImage(env, id) {
+  if (!/^[0-9a-f-]{36}$/.test(id)) return new Response("not found", { status: 404 });
+  const buf = await env.STUDIO_KV.get(`img:${id}`, "arrayBuffer");
+  if (!buf) return new Response("not found", { status: 404 });
+  return new Response(buf, {
+    headers: {
+      "content-type": "image/png",
+      "cache-control": "public, max-age=86400",
+      "content-length": String(buf.byteLength),
+    },
+  });
+}
+
 /* ---------------- chat (SSE) ---------------- */
 
 const DECIDE_SYSTEM = `أنت مخطط أدوات لوكيل ذكاء اصطناعي. أمامك رسالة المستخدم وقائمة الأدوات المتاحة.
-إن كانت الرسالة تحتاج أداة فعلاً (حساب، وقت، عملات، جلب رابط، تذكير، API خارجي) أعد JSON فقط:
+إن كانت الرسالة تحتاج أداة فعلاً (حساب، وقت، عملات، جلب رابط، تذكير، API خارجي، رسم/توليد صورة) أعد JSON فقط:
 {"tool":"اسم_الأداة","args":{...}}
 وإلا أعد JSON فقط: {"answer":true}
 لا تضف أي نص خارج JSON.`;
@@ -285,6 +345,7 @@ async function handleChat(req, env, kvH) {
         // Phase 1: decide tool
         const enabledTools = (agent.tools || []).map(getBuiltinTool).filter(Boolean);
         let toolResultText = "";
+        const imageIds = [];
         try {
           const decision = await decideTool(env, agent, enabledTools, userText);
           if (decision) {
@@ -294,6 +355,7 @@ async function handleChat(req, env, kvH) {
             const ctx = {
               fetch, agent, env,
               getCustomTool: async (id) => kvH.get(`tool:${id}`),
+              generateImage: (prompt, model) => generateImage(env, prompt, model),
               addReminder: async (agentId, item) => {
                 const k = `reminders:${agentId}`;
                 const list = (await kvH.get(k)) || [];
@@ -302,8 +364,10 @@ async function handleChat(req, env, kvH) {
               },
             };
             const out = await tool.run(decision.args, ctx);
+            if (decision.name === "image_generate" && out && out.id) imageIds.push(out.id);
             toolResultText = `نتيجة الأداة (${tool.label}): ${JSON.stringify(out).slice(0, 2000)}`;
             await bumpStat(kvH, "toolCalls");
+            if (decision.name === "image_generate") await bumpStat(kvH, "images");
           }
         } catch (e) {
           toolResultText = `تعذّر استخدام الأداة: ${errDetail(e)} — أجب بدونها.`;
@@ -350,7 +414,7 @@ async function handleChat(req, env, kvH) {
 
         // Persist
         conv.messages.push({ role: "user", content: userText });
-        conv.messages.push({ role: "assistant", content: full, tools: toolsUsed });
+        conv.messages.push({ role: "assistant", content: full, tools: toolsUsed, images: imageIds });
         conv.messages = conv.messages.slice(-60);
         conv.updatedAt = new Date().toISOString();
         if (conv.title === "محادثة جديدة") conv.title = userText.slice(0, 40);
@@ -363,7 +427,7 @@ async function handleChat(req, env, kvH) {
         await bumpStat(kvH, "messages", 2);
         await bumpStat(kvH, "neurons", chatNeurons(modelId, system.length + userText.length, full.length));
 
-        send({ type: "done", tools: toolsUsed });
+        send({ type: "done", tools: toolsUsed, images: imageIds });
         controller.close();
       } catch (e) {
         if (isQuotaError(e)) send({ type: "error", code: "quota" });
@@ -545,11 +609,12 @@ async function handleTools(req, kvH) {
 async function handleDashboard(kvH) {
   const agents = await listAgents(kvH);
   const day = new Date().toISOString().slice(0, 10);
-  const [messages, toolCalls, neurons, agentsCreated] = await Promise.all([
+  const [messages, toolCalls, neurons, agentsCreated, images] = await Promise.all([
     kvH.get(`stats:${day}:messages`),
     kvH.get(`stats:${day}:toolCalls`),
     kvH.get(`stats:${day}:neurons`),
     kvH.get(`stats:${day}:agentsCreated`),
+    kvH.get(`stats:${day}:images`),
   ]);
   // Last 7 days activity
   const series = [];
@@ -564,6 +629,7 @@ async function handleDashboard(kvH) {
     today: {
       messages: messages || 0, toolCalls: toolCalls || 0,
       neurons: neurons || 0, agentsCreated: agentsCreated || 0,
+      images: images || 0,
       quotaLeft: Math.max(0, FREE_NEURONS_PER_DAY - (neurons || 0)),
     },
     series,
@@ -582,14 +648,24 @@ export default {
       return env.ASSETS.fetch(request);
     }
 
-    // Password gate (optional)
-    if (path !== "/api/config" && !(await checkPassword(request, env))) {
+    // Password gate (optional).
+    // /api/images/* uses unguessable UUID URLs and must load inside <img>
+    // tags (which can't send the x-app-password header), so it is exempt.
+    const isPublicImage = path.startsWith("/api/images/");
+    if (path !== "/api/config" && !isPublicImage && !(await checkPassword(request, env))) {
       return json({ code: "unauthorized", message: "كلمة المرور غير صحيحة" }, 401);
     }
 
     const kvH = kv(env);
     try {
       if (path === "/api/config" && request.method === "GET") return handleConfig();
+
+      let mImg = path.match(/^\/api\/images\/([A-Za-z0-9-]+)$/);
+      if (mImg && request.method === "GET") return handleImage(env, mImg[1]);
+
+      if (path === "/api/generate-image" && request.method === "POST") {
+        return handleGenerateImage(request, env, kvH);
+      }
 
       if (path === "/api/agents") return handleAgents(request, kvH, url);
       if (path === "/api/agents/quick" && request.method === "POST") {
