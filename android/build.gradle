@@ -1,0 +1,7 @@
+// Top-level build file for the Android WebView wrapper.
+// The backend URL is injected at build time via -PappUrl=... (CI) or
+// gradle.properties (local). See .github/workflows/build-apk.yml.
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+    id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+}
