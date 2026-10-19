@@ -653,3 +653,96 @@ test("gaps endpoint returns knowledge gaps across agents", async () => {
   assert.ok(Array.isArray(gaps.gaps));
   assert.ok(gaps.gaps.some((g) => g.agentId === agent.id));
 });
+
+/* ---------- deep research ---------- */
+
+function researchEnv() {
+  return mockEnv(async (model, input) => {
+    if (String(model).includes("bge")) {
+      return { data: input.text.map(() => [0.5, 0.5]) };
+    }
+    const sys = JSON.stringify(input.messages || []);
+    if (sys.includes("باحث محلل")) {
+      return { response: "## ملخص تنفيذي\nالذهب معدن ثمين.\n## النقاط الرئيسية\n1. نقطة أولى.\n## تحليل\nتحليل مختصر.\n## المصادر\nالويب." };
+    }
+    if (sys.includes("استخرج أهم")) {
+      return { response: '{"lessons":["الذهب معدن ثمين","يستخدم في الحلي"]}' };
+    }
+    if (sys.includes("مخطط أدوات")) return { response: '{"answer":true}' };
+    return { response: "رد عادي." };
+  });
+}
+
+function stubFetch() {
+  const real = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("duckduckgo")) return { ok: false, status: 403 };
+    if (String(url).includes("wikipedia.org/w/api.php")) {
+      return { ok: true, json: async () => ({ query: { search: [{ title: "ذهب", snippet: "معدن ثمين" }] } }) };
+    }
+    return {
+      ok: true,
+      text: async () => "<html><head><title>الذهب - ويكيبيديا</title></head><body><p>الذهب عنصر كيميائي رمزه Au وهو معدن ثمين أصفر اللون يستخدم في الحلي والاستثمار منذ آلاف السنين في مختلف الحضارات الإنسانية.</p></body></html>",
+    };
+  };
+  return () => { globalThis.fetch = real; };
+}
+
+test("deep research trigger runs the full pipeline with live stages", async () => {
+  const env = researchEnv();
+  const restore = stubFetch();
+  try {
+    const { agent } = await (await postJson(env, "/api/agents", { name: "R" })).json();
+    const text = await (await postJson(env, "/api/chat", { agentId: agent.id, message: "ابحث بعمق عن الذهب" })).text();
+    assert.ok(text.includes('"type":"research"'));
+    assert.ok(text.includes('"stage":"kb"'));
+    assert.ok(text.includes('"stage":"web"'));
+    assert.ok(text.includes('"stage":"analyze"'));
+    assert.ok(text.includes('"stage":"learn"'));
+    assert.ok(text.includes('"stage":"done"'));
+    assert.ok(text.includes("ملخص تنفيذي")); // report streamed as answer
+    assert.ok(text.includes('"type":"done"'));
+  } finally { restore(); }
+});
+
+test("deep research prefers KB when it has enough hits (web skipped)", async () => {
+  const env = researchEnv();
+  const restore = stubFetch();
+  try {
+    const { agent } = await (await postJson(env, "/api/agents", { name: "R2" })).json();
+    // Train with a file so the KB has content
+    const fd = new FormData();
+    fd.append("agentId", agent.id);
+    fd.append("file", new Blob(["الذهب معدن ثمين أصفر. ".repeat(60)], { type: "text/plain" }), "gold.txt");
+    const tr = await api(env, "/api/train", { method: "POST", body: fd });
+    assert.equal(tr.status, 200);
+    const text = await (await postJson(env, "/api/chat", { agentId: agent.id, message: "ابحث بعمق عن الذهب" })).text();
+    assert.ok(text.includes('"stage":"kb"'));
+    assert.ok(text.includes('"state":"skipped"')); // web skipped, KB sufficient
+    // Lessons were saved to the agent's mind
+    const brain = await (await api(env, `/api/brain/${agent.id}`)).json();
+    const lessonNodes = brain.nodes.filter((n) => n.kind === "lesson");
+    assert.ok(lessonNodes.length >= 1);
+  } finally { restore(); }
+});
+
+test("research history is saved and listed", async () => {
+  const env = researchEnv();
+  const restore = stubFetch();
+  try {
+    const { agent } = await (await postJson(env, "/api/agents", { name: "R3" })).json();
+    await (await postJson(env, "/api/chat", { agentId: agent.id, message: "ابحث بعمق عن الفضة" })).text();
+    const { research } = await (await api(env, `/api/research/${agent.id}`)).json();
+    assert.ok(Array.isArray(research));
+    assert.equal(research.length, 1);
+    assert.ok(research[0].query.includes("الفضة"));
+    assert.ok(research[0].summary.length > 0);
+  } finally { restore(); }
+});
+
+test("normal chat does not trigger research", async () => {
+  const env = researchEnv();
+  const { agent } = await (await postJson(env, "/api/agents", { name: "R4" })).json();
+  const text = await (await postJson(env, "/api/chat", { agentId: agent.id, message: "مرحبا كيف حالك" })).text();
+  assert.ok(!text.includes('"type":"research"'));
+});
