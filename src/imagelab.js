@@ -17,9 +17,9 @@ export const EVAL_CRITERIA = [
   { key: "finish", label: "الإتقان العام", hint: "finished professional look, consistent detail, ready to use" },
 ];
 
-const EVAL_SYSTEM = `You are a strict art director judging an AI-generated image.
+const EVAL_SYSTEM_BASE = `You are a strict art director judging an AI-generated image.
 The original text prompt was: "{PROMPT}"
-
+{NICHE_RULE}
 Score the image 1-5 (integers) on each criterion:
 - composition: hero subject fills the frame, no empty voids, balanced layout
 - lines: clean confident outlines, no wobbly/broken/sketchy strokes
@@ -35,6 +35,26 @@ Reply with JSON ONLY, no markdown, no extra text:
 "lesson":"one short imperative lesson for the NEXT generation, e.g. 'fill empty corners with small filler motifs'"}
 Write strengths, issues and lesson in ARABIC. Be honest and specific — never
 give 5/5 when real flaws exist.`;
+
+/** Niche-aware strict gate appended to the eval prompt. */
+function nicheRule(nicheKey) {
+  if (nicheKey === "coloring-page") {
+    return `STRICT GATE — the requested niche is a COLORING PAGE (pure black and white line art).
+If the image contains ANY color, shading, gray tones or gradients, styleMatch MUST be 1
+and the FIRST issue MUST state: "colored/shaded image delivered instead of a black-and-white coloring page".`;
+  }
+  if (nicheKey === "coloring-cover") {
+    return `STRICT GATE — the requested niche is a COLORING BOOK COVER (full-color illustration).
+If the image is black-and-white line art instead of a full-color illustration, styleMatch MUST be 1.`;
+  }
+  return "";
+}
+
+function buildEvalPrompt(prompt, nicheKey) {
+  return EVAL_SYSTEM_BASE
+    .replace("{PROMPT}", String(prompt || "").slice(0, 500))
+    .replace("{NICHE_RULE}", nicheRule(nicheKey));
+}
 
 function clampScore(v) {
   const n = Number(v);
@@ -70,14 +90,14 @@ export function safeParseEval(text) {
 
 /**
  * Ask the vision model to critique a generated image.
- * imageB64: base64 PNG/JPEG bytes. Returns the parsed evaluation.
- * Throws when the vision call fails (caller decides fallback).
+ * imageB64: base64 PNG/JPEG bytes. nicheKey enables the strict style gate.
+ * Returns the parsed evaluation. Throws when the vision call fails.
  */
-export async function analyzeImage(env, imageB64, prompt) {
+export async function analyzeImage(env, imageB64, prompt, nicheKey) {
   if (!imageB64) throw new Error("no image bytes");
   const out = await env.AI.run(VISION_MODEL, {
     image: imageB64,
-    prompt: EVAL_SYSTEM.replace("{PROMPT}", String(prompt || "").slice(0, 500)),
+    prompt: buildEvalPrompt(prompt, nicheKey),
     max_tokens: 900,
   });
   const text = typeof out?.response === "string" ? out.response : "";
@@ -85,11 +105,11 @@ export async function analyzeImage(env, imageB64, prompt) {
   return safeParseEval(text);
 }
 
-/** Last N image lessons for prompt enrichment. */
-export async function getImageLessons(kv, agentId, n = 3) {
+/** Last N image/niche lessons for prompt enrichment. */
+export async function getImageLessons(kv, agentId, n = 3, sources = ["image-eval", "niche-research"]) {
   const learned = (await kv.get(`learned:${agentId}`)) || [];
   return learned
-    .filter((l) => l && l.source === "image-eval" && l.text)
+    .filter((l) => l && sources.includes(l.source) && l.text)
     .slice(-n)
     .map((l) => String(l.text));
 }
@@ -110,7 +130,7 @@ const LEARNED_CAP = 60;
  * append lesson to memory → learning-log event (shows in Brain map).
  * Never throws: on vision failure stores {evaluated:false} so the UI can retry.
  */
-export async function evaluateAndLearn(env, kv, agent, imageId, prompt, imageB64) {
+export async function evaluateAndLearn(env, kv, agent, imageId, prompt, imageB64, nicheKey) {
   const now = new Date().toISOString();
   const agentId = agent?.id || "global";
   if (agent && agent.imageLearn === false) {
@@ -118,16 +138,16 @@ export async function evaluateAndLearn(env, kv, agent, imageId, prompt, imageB64
   }
   let ev;
   try {
-    ev = await analyzeImage(env, imageB64, prompt);
+    ev = await analyzeImage(env, imageB64, prompt, nicheKey);
   } catch (e) {
     ev = null;
   }
   if (!ev) {
-    const failed = { evaluated: false, reason: "vision-failed", at: now, prompt: String(prompt || "").slice(0, 200) };
+    const failed = { evaluated: false, reason: "vision-failed", at: now, prompt: String(prompt || "").slice(0, 200), niche: nicheKey || null };
     await kv.set(`imgeval:${imageId}`, failed);
     return failed;
   }
-  const record = { evaluated: true, at: now, prompt: String(prompt || "").slice(0, 200), ...ev };
+  const record = { evaluated: true, at: now, prompt: String(prompt || "").slice(0, 200), niche: nicheKey || null, ...ev };
 
   // 1) Per-image evaluation record (the "memory" of this image)
   await kv.set(`imgeval:${imageId}`, record);
@@ -135,7 +155,7 @@ export async function evaluateAndLearn(env, kv, agent, imageId, prompt, imageB64
   // 2) Per-agent image history (for gallery badges + Brain nodes)
   const logKey = `imglog:${agentId}`;
   const log = (await kv.get(logKey)) || [];
-  log.push({ id: imageId, at: now, prompt: String(prompt || "").slice(0, 200), overall: ev.overall });
+  log.push({ id: imageId, at: now, prompt: String(prompt || "").slice(0, 200), overall: ev.overall, niche: nicheKey || null });
   await kv.set(logKey, log.slice(-IMGLOG_CAP));
 
   // 3) Lesson → agent's learned instructions (steers future generations)
