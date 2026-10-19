@@ -861,3 +861,49 @@ canvas#dash-chart { width: 100%; }
 .ticker-item { font-size: 13.5px; color: #cfe3f5; }
 .ticker-item b { color: #fff; }
 .ticker-sep { color: #4a7ba6; font-size: 12px; }
+
+/* ---------- 🐙 Octopus v2 ---------- */
+.octo-card {
+  background: linear-gradient(135deg, #1d1240 0%, #2b1a5e 60%, #1a2b4a 100%);
+  border: 1px solid #6d4de0;
+}
+.octo-head { display: flex; align-items: center; gap: 12px; }
+.octo-emoji { font-size: 44px; filter: drop-shadow(0 0 12px #a78bfa); }
+.octo-head b { font-size: 17px; }
+.octo-live {
+  margin-inline-start: auto; font-size: 12px; color: #7ef0c1;
+  display: flex; align-items: center; gap: 6px;
+  background: rgba(52, 211, 153, 0.12); border: 1px solid rgba(52,211,153,.4);
+  padding: 4px 10px; border-radius: 20px;
+}
+.octo-live .dot { width: 8px; height: 8px; border-radius: 50%; background: #34d399; animation: blink 1.6s ease-in-out infinite; }
+.octo-arms { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.arm {
+  font-size: 22px; background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.14);
+  width: 44px; height: 44px; display: flex; align-items: center; justify-content: center;
+  border-radius: 14px;
+}
+.gap-count {
+  font-size: 12px; color: #fbbf24; background: rgba(251,191,36,.12);
+  border: 1px solid rgba(251,191,36,.4); border-radius: 12px; padding: 1px 8px;
+}
+/* Welcome overlay */
+.welcome {
+  position: fixed; inset: 0; z-index: 200; display: flex; align-items: center; justify-content: center;
+  background: rgba(7, 10, 24, 0.92); backdrop-filter: blur(6px); padding: 24px;
+}
+.welcome.hidden { display: none; }
+.welcome-card {
+  background: linear-gradient(160deg, #1d1240, #101736); border: 1px solid #6d4de0;
+  border-radius: 24px; padding: 32px 24px; max-width: 380px; text-align: center;
+  box-shadow: 0 20px 60px rgba(124, 58, 237, 0.35);
+}
+.welcome-emoji { font-size: 72px; margin-bottom: 8px; filter: drop-shadow(0 0 20px #a78bfa); }
+.welcome-card h2 { margin: 8px 0; }
+.welcome-card p { color: #b9c4e2; line-height: 1.8; }
+.welcome-list { text-align: start; line-height: 2.1; padding: 0 8px; margin: 16px 0 20px; list-style: none; }
+.octo-badge {
+  font-size: 11px; color: #d8b4fe; background: rgba(139, 92, 246, 0.18);
+  border: 1px solid rgba(139, 92, 246, 0.5); border-radius: 12px; padding: 1px 8px;
+  white-space: nowrap;
+}
