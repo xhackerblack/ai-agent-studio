@@ -185,6 +185,12 @@ async function loadAgents() {
     box.appendChild(d);
   }
   fillAgentSelects();
+  // Reconcile: if the current agent was deleted or never loaded, pick the first available
+  if (!state.agents.some((a) => a.id === state.currentAgent)) {
+    state.currentAgent = state.agents.length ? state.agents[0].id : null;
+    const sel = $("chat-agent");
+    if (sel) sel.value = state.currentAgent || "";
+  }
 }
 
 function fillAgentSelects() {
@@ -528,8 +534,15 @@ $("btn-learn-now").onclick = async () => {
 
 /* Training sheet */
 $("btn-train-open").onclick = () => {
+  const agent = state.agents.find((a) => a.id === state.currentAgent);
+  if (!agent) {
+    toast("أنشئ وكيلاً أولاً من تبويب الوكلاء 🤖", true);
+    showView("agents");
+    return;
+  }
   openSheet(`
     <h2>📄 تدريب بملف واحد</h2>
+    <p class="muted">سيتدرب الوكيل: <b>${agent.avatar} ${escapeHtml(agent.name)}</b></p>
     <p class="muted">ارفع ملفاً (TXT / MD / CSV / JSON / HTML — وPDF تجريبياً) وسيتعلم منه الوكيل تلقائياً.</p>
     <input type="file" id="train-file" accept=".txt,.md,.csv,.json,.html,.pdf">
     <div id="train-status" class="note hidden"></div>
@@ -539,6 +552,8 @@ $("btn-train-open").onclick = () => {
     const st = $("train-status");
     st.classList.remove("hidden");
     if (!f) { st.textContent = "اختر ملفاً أولاً"; return; }
+    const ag = state.agents.find((a) => a.id === state.currentAgent);
+    if (!ag) { st.textContent = "الوكيل غير موجود — أعد اختيار الوكيل"; st.className = "note err"; return; }
     st.textContent = "⏳ جارٍ استخراج النص وتوليد المعرفة… (قد يستغرق دقيقة)";
     try {
       const fd = new FormData();
