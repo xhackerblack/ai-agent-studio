@@ -325,13 +325,41 @@ test("learn helpers: transcript truncates", () => {
 
 /* ---------- image generation ---------- */
 
-function imageEnv() {
-  return mockEnv(async (model, args) => {
-    assert.ok(String(model).includes("flux") || String(model).includes("dreamshaper"));
-    assert.ok(args.prompt && args.prompt.length > 0);
-    // FLUX returns base64 JSON
-    return { image: Buffer.from("fake-png-bytes").toString("base64") };
+function imageEnv(visionScores) {
+  let imageCalls = 0;
+  const prompts = [];
+  const env = mockEnv(async (model, args) => {
+    const m = String(model);
+    if (m.includes("flux") || m.includes("dreamshaper")) {
+      imageCalls++;
+      assert.ok(args.prompt && args.prompt.length > 0);
+      prompts.push(args.prompt);
+      // FLUX returns base64 JSON
+      return { image: Buffer.from("fake-png-bytes").toString("base64") };
+    }
+    if (m.includes("vision")) {
+      let s = visionScores;
+      if (Array.isArray(s)) s = s.length > 1 ? s.shift() : s[0];
+      s = s || { composition: 4, lines: 4, artifacts: 4, styleMatch: 4, finish: 4 };
+      return {
+        response: JSON.stringify({
+          scores: s, strengths: ["تكوين جيد"], issues: s.styleMatch <= 2 ? ["صورة ملوّنة بدل صفحة تلوين"] : [],
+          lesson: "درس تجريبي",
+        }),
+      };
+    }
+    // chat LLMs: niche analyzer vs prompt refiner (distinguished by system prompt)
+    const sys = (args.messages && args.messages[0] && args.messages[0].content) || "";
+    const userText = (args.messages && args.messages[1] && args.messages[1].content) || "";
+    if (sys.includes("niche classifier")) {
+      const niche = /coloring book|coloring page|تلوين/i.test(userText) ? "coloring-page" : "general";
+      return { response: JSON.stringify({ niche, subject: "a test subject", audience: "any" }) };
+    }
+    return { response: "a refined test description of the scene" };
   });
+  env._imageCalls = () => imageCalls;
+  env._prompts = () => prompts;
+  return env;
 }
 
 test("config exposes image models", async () => {
@@ -367,6 +395,53 @@ test("POST /api/generate-image rejects empty prompt", async () => {
   const env = imageEnv();
   const res = await postJson(env, "/api/generate-image", { prompt: "  " });
   assert.equal(res.status, 400);
+});
+
+test("niche pipeline: coloring-page request carries B&W style block to the model", async () => {
+  const env = imageEnv();
+  const res = await postJson(env, "/api/generate-image", { prompt: "Fall coloring autumn coloring book cozy home" });
+  assert.equal(res.status, 201);
+  const body = await res.json();
+  assert.equal(body.niche.key, "coloring-page");
+  assert.equal(body.niche.label, "صفحة تلوين");
+  const sent = env._prompts()[0];
+  assert.match(sent, /black and white/);
+  assert.match(sent, /line art/);
+  assert.match(sent, /no shading/);
+});
+
+test("strict gate: styleMatch 1 triggers exactly one regeneration", async () => {
+  const env = imageEnv([
+    { composition: 4, lines: 4, artifacts: 4, styleMatch: 1, finish: 4 },
+    { composition: 4, lines: 4, artifacts: 4, styleMatch: 4, finish: 4 },
+  ]);
+  const agent = await (await postJson(env, "/api/agents", { name: "رسام" })).json();
+  const res = await postJson(env, "/api/generate-image", { prompt: "coloring page flowers", agentId: agent.agent.id });
+  assert.equal(res.status, 201);
+  const body = await res.json();
+  assert.equal(env._imageCalls(), 2); // exactly one retry, no loop
+  assert.equal(body.evaluation.evaluated, true);
+  assert.equal(body.evaluation.regenerated, true);
+  assert.match(env._prompts()[1], /CRITICAL CORRECTION/);
+});
+
+test("winning niche prompt is remembered as a template", async () => {
+  const env = imageEnv();
+  const agent = await (await postJson(env, "/api/agents", { name: "رسام2" })).json();
+  await postJson(env, "/api/generate-image", { prompt: "coloring page cat", agentId: agent.agent.id });
+  const tpl = await env.STUDIO_KV.get("nichetemplate:coloring-page", "json");
+  assert.ok(tpl && tpl.score >= 4);
+});
+
+test("POST /api/niche/analyze detects niche and refines the prompt", async () => {
+  const env = imageEnv();
+  const res = await postJson(env, "/api/niche/analyze", { text: "Fall coloring autumn coloring book cozy home hygge" });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.niche, "coloring-page");
+  assert.equal(body.refined, "a refined test description of the scene");
+  assert.equal(body.check.ok, true);
+  assert.match(body.finalPreview, /black and white/);
 });
 
 test("GET /api/images/:bad-id returns 404", async () => {
