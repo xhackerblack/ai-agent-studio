@@ -514,6 +514,9 @@ canvas#dash-chart { width: 100%; }
   cursor: pointer;
   border: 1px solid var(--line);
 }
+/* wrapper div for score badges (see renderGallery) */
+.img-grid > div { position: relative; }
+.img-grid > div img { display: block; }
 .img-result-card img.gen-img {
   width: 100%;
   border-radius: var(--radius);
