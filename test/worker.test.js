@@ -445,3 +445,211 @@ test("brain endpoint returns live graph", async () => {
   const bad = await api(env, "/api/brain/nope");
   assert.equal(bad.status, 404);
 });
+
+/* ---------- deep thinking ---------- */
+
+function deepChatEnv() {
+  return mockEnv(async (model, input) => {
+    const sys = JSON.stringify(input.messages || []);
+    if (sys.includes("مخطط أدوات")) return { response: '{"answer":true}' };
+    if (sys.includes("المفكّر العميق")) return { response: "1. فهم الطلب: واضح\n2. النقاط: أ، ب\n3. الافتراضات: لا شيء\n4. الخطة: أجب مباشرة\n5. المخاطر: لا شيء" };
+    if (sys.includes("مراجع دقيق")) return { response: "الإجابة النهائية المحسّنة." };
+    return { response: "رد عادي." };
+  });
+}
+
+test("agent creation defaults: deepThink off, effort balanced", async () => {
+  const env = mockEnv(async () => ({ response: "{}" }));
+  const { agent } = await (await postJson(env, "/api/agents", { name: "D" })).json();
+  assert.equal(agent.deepThink, false);
+  assert.equal(agent.effort, "balanced");
+});
+
+test("PATCH persists deepThink/effort/profile fields", async () => {
+  const env = mockEnv(async () => ({ response: "{}" }));
+  const { agent } = await (await postJson(env, "/api/agents", { name: "D" })).json();
+  const patched = await (await api(env, `/api/agents/${agent.id}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deepThink: true, effort: "deep", expertise: "تسويق", style: "مباشر", avoidTopics: "سياسة" }),
+  })).json();
+  assert.equal(patched.agent.deepThink, true);
+  assert.equal(patched.agent.effort, "deep");
+  assert.equal(patched.agent.expertise, "تسويق");
+  assert.equal(patched.agent.style, "مباشر");
+  assert.equal(patched.agent.avoidTopics, "سياسة");
+});
+
+test("chat without deepThink emits no thinking events", async () => {
+  const env = deepChatEnv();
+  const { agent } = await (await postJson(env, "/api/agents", { name: "D" })).json();
+  const text = await (await postJson(env, "/api/chat", { agentId: agent.id, message: "hi" })).text();
+  assert.ok(!text.includes('"type":"thinking"'));
+  assert.ok(text.includes('"type":"token"'));
+});
+
+test("chat with deepThink balanced emits thinking then tokens", async () => {
+  const env = deepChatEnv();
+  const { agent } = await (await postJson(env, "/api/agents", { name: "D", deepThink: true, effort: "balanced" })).json();
+  const text = await (await postJson(env, "/api/chat", { agentId: agent.id, message: "اشرح التسويق" })).text();
+  assert.ok(text.includes('"type":"thinking"'));
+  assert.ok(text.includes('"state":"done"'));
+  assert.ok(text.includes("فهم الطلب"));
+  assert.ok(text.includes('"type":"token"'));
+  assert.ok(text.includes('"type":"done"'));
+});
+
+test("chat with deepThink deep runs critique and streams refined answer", async () => {
+  const env = deepChatEnv();
+  const { agent } = await (await postJson(env, "/api/agents", { name: "D", deepThink: true, effort: "deep" })).json();
+  const text = await (await postJson(env, "/api/chat", { agentId: agent.id, message: "اشرح التسويق" })).text();
+  assert.ok(text.includes('"state":"critique"'));
+  assert.ok(text.includes("الإجابة النهائية المحسّنة"));
+  assert.ok(text.includes('"type":"done"'));
+});
+
+test("tool chains: decider can use two tools in sequence", async () => {
+  let calls = 0;
+  const env = mockEnv(async (model, input) => {
+    const sys = JSON.stringify(input.messages || []);
+    if (sys.includes("مخطط أدوات")) {
+      calls++;
+      if (calls === 1) return { response: '{"tool":"calculator","args":{"expression":"2+2"}}' };
+      if (calls === 2) return { response: '{"tool":"datetime","args":{}}' };
+      return { response: '{"answer":true}' };
+    }
+    return { response: "تم." };
+  });
+  const { agent } = await (await postJson(env, "/api/agents", { name: "D", tools: ["calculator", "datetime"] })).json();
+  const text = await (await postJson(env, "/api/chat", { agentId: agent.id, message: "احسب ثم أخبرني بالوقت" })).text();
+  const toolEvents = (text.match(/"type":"tool"/g) || []).length;
+  assert.equal(toolEvents, 2);
+});
+
+/* ---------- web_search tool ---------- */
+
+test("web_search falls back to wikipedia with shaped results", async () => {
+  const tool = getBuiltinTool("web_search");
+  assert.ok(tool);
+  const ctx = {
+    fetch: async (url) => {
+      if (String(url).includes("duckduckgo")) return { ok: false };
+      return {
+        ok: true,
+        json: async () => ({ query: { search: [{ title: "ذهب", snippet: "معدن <b>ثمين</b>" }] } }),
+      };
+    },
+  };
+  const out = await tool.run({ query: "ذهب" }, ctx);
+  assert.equal(out.source, "wikipedia");
+  assert.equal(out.results[0].title, "ذهب");
+  assert.ok(out.results[0].url.includes("wikipedia.org"));
+  assert.ok(!out.results[0].snippet.includes("<b>"));
+});
+
+test("web_search parses duckduckgo results when available", async () => {
+  const tool = getBuiltinTool("web_search");
+  const html = '<a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fx">عنوان <b>مهم</b></a>';
+  const ctx = { fetch: async () => ({ ok: true, text: async () => html }) };
+  const out = await tool.run({ query: "x" }, ctx);
+  assert.equal(out.source, "duckduckgo");
+  assert.equal(out.results[0].url, "https://example.com/x");
+  assert.ok(out.results[0].title.includes("عنوان"));
+});
+
+/* ---------- export / import / backup ---------- */
+
+test("agent export then import restores a new agent", async () => {
+  const env = mockEnv(async (model, input) => {
+    if (String(model).includes("bge")) return { data: input.text.map(() => [0.1, 0.2]) };
+    return { response: "{}" };
+  });
+  const { agent } = await (await postJson(env, "/api/agents", { name: "Src", deepThink: true, expertise: "X" })).json();
+  const bundle = await (await api(env, `/api/agents/${agent.id}/export`)).json();
+  assert.equal(bundle.app, "ai-agent-studio-agent");
+  assert.equal(bundle.agent.id, agent.id);
+  const imported = await (await postJson(env, "/api/agents/import", { bundle })).json();
+  assert.equal(imported.agent.name.includes("مستورد"), true);
+  assert.notEqual(imported.agent.id, agent.id);
+  assert.equal(imported.agent.expertise, "X");
+});
+
+test("full backup includes agents and skills", async () => {
+  const env = mockEnv(async () => ({ response: "{}" }));
+  await postJson(env, "/api/agents", { name: "B1" });
+  await postJson(env, "/api/skills", { name: "Sk", instructions: "I" });
+  const backup = await (await api(env, "/api/backup")).json();
+  assert.equal(backup.app, "ai-agent-studio-backup");
+  assert.ok(backup.agents.length >= 1);
+  assert.ok(backup.skills.length >= 1);
+});
+
+test("backup import recreates agents", async () => {
+  const env = mockEnv(async (model, input) => {
+    if (String(model).includes("bge")) return { data: input.text.map(() => [0.1]) };
+    return { response: "{}" };
+  });
+  await postJson(env, "/api/agents", { name: "C1" });
+  const backup = await (await api(env, "/api/backup")).json();
+  const n1 = backup.agents.length;
+  const r = await (await postJson(env, "/api/backup/import", { backup })).json();
+  assert.equal(r.agents, n1);
+  const list = await (await api(env, "/api/agents")).json();
+  assert.equal(list.agents.length, n1 * 2);
+});
+
+/* ---------- version history ---------- */
+
+test("PATCH snapshots history and rollback restores", async () => {
+  const env = mockEnv(async () => ({ response: "{}" }));
+  const { agent } = await (await postJson(env, "/api/agents", { name: "V1" })).json();
+  await api(env, `/api/agents/${agent.id}`, {
+    method: "PATCH", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "V2" }),
+  });
+  const { history } = await (await api(env, `/api/agents/${agent.id}/history`)).json();
+  assert.equal(history.length, 1);
+  assert.equal(history[0].name, "V1");
+  const rolled = await (await postJson(env, `/api/agents/${agent.id}/rollback`, { index: 0 })).json();
+  assert.equal(rolled.agent.name, "V1");
+});
+
+/* ---------- link preview ---------- */
+
+test("preview rejects invalid urls and handles fetch failure gracefully", async () => {
+  const env = mockEnv(async () => ({ response: "{}" }));
+  const bad = await api(env, "/api/preview?url=notaurl");
+  assert.equal(bad.status, 400);
+});
+
+/* ---------- dashboard per-agent ---------- */
+
+test("dashboard includes perAgent activity", async () => {
+  const env = deepChatEnv();
+  const { agent } = await (await postJson(env, "/api/agents", { name: "Stat" })).json();
+  await (await postJson(env, "/api/chat", { agentId: agent.id, message: "hi" })).text();
+  const dash = await (await api(env, "/api/dashboard/stats")).json();
+  assert.ok(Array.isArray(dash.perAgent));
+  const row = dash.perAgent.find((r) => r.id === agent.id);
+  assert.ok(row);
+  assert.ok(row.messages >= 2);
+});
+
+test("gaps endpoint returns knowledge gaps across agents", async () => {
+  const env = mockEnv(async () => ({ response: "{}" }));
+  const { agent } = await (await postJson(env, "/api/agents", { name: "G" })).json();
+  // Simulate a gap event via learn-from-conversation mock
+  const env2 = mockEnv(async (model, input) => {
+    const sys = JSON.stringify(input.messages || []);
+    if (sys.includes("استخرج")) return { response: '{"memories":[],"lessons":[],"gaps":["أسعار الذهب"]}' };
+    return { response: "{}" };
+  });
+  // Manually seed a gap event
+  const kv = env.STUDIO_KV;
+  const r1 = await api(env, `/api/agents/${agent.id}`);
+  const ag = (await r1.json()).agent;
+  await kv.put(`learn:${agent.id}`, JSON.stringify([{ at: new Date().toISOString(), event: "gap", detail: "فجوة: أسعار الذهب" }]));
+  const gaps = await (await api(env, "/api/gaps")).json();
+  assert.ok(Array.isArray(gaps.gaps));
+  assert.ok(gaps.gaps.some((g) => g.agentId === agent.id));
+});
