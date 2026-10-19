@@ -151,9 +151,10 @@ async function loadAgents() {
   for (const a of state.agents) {
     const d = document.createElement("div");
     d.className = "card agent-row";
+    const octoBadge = a.isOctopus ? ' <span class="octo-badge" title="الوكيل الخارق">🐙 خارق</span>' : "";
     d.innerHTML = `
       <div class="av">${a.avatar}</div>
-      <div><div class="nm">${escapeHtml(a.name)}</div>
+      <div><div class="nm">${escapeHtml(a.name)}${octoBadge}</div>
       <div class="ds">${escapeHtml(a.description || a.tone || "")}</div></div>
       <div class="spacer"></div>
       <div class="ops">
@@ -368,8 +369,6 @@ async function saveAgentModal() {
     closeSheet(); toast("تم حفظ الوكيل ✅"); loadAgents();
   } catch (e) { toast(errText(e), true); }
 }
-$("cta-create").onclick = () => { showView("agents"); openAgentModal(null); };
-
 /* Quick customize */
 $("btn-quick").onclick = async () => {
   const desc = $("quick-desc").value.trim();
@@ -740,12 +739,19 @@ $("btn-research-open").onclick = () => {
     <p class="muted">سيبحث الوكيل <b>${agent.avatar} ${escapeHtml(agent.name)}</b> في قاعدة معرفته أولاً،
     ثم في الويب إن لزم، ويلخّص ويحلّل — ويحفظ الدروس في عقله.</p>
     <input id="research-topic" placeholder="موضوع البحث… (مثال: أسعار الذهب اليوم)">
+    <div class="row" style="margin-bottom:8px">
+      <button class="chip on" id="rs-depth-deep">🔬 معمق</button>
+      <button class="chip" id="rs-depth-full">📖 شامل</button>
+    </div>
     <button class="btn primary big" id="btn-research-start">🔬 ابدأ البحث</button>`);
+  let depth = "deep";
+  $("rs-depth-deep").onclick = () => { depth = "deep"; $("rs-depth-deep").classList.add("on"); $("rs-depth-full").classList.remove("on"); };
+  $("rs-depth-full").onclick = () => { depth = "full"; $("rs-depth-full").classList.add("on"); $("rs-depth-deep").classList.remove("on"); };
   const start = () => {
     const t = $("research-topic").value.trim();
     if (!t) return toast("اكتب موضوع البحث أولاً", true);
     closeSheet();
-    $("chat-text").value = `ابحث بعمق عن: ${t}`;
+    $("chat-text").value = depth === "full" ? `بحث شامل عن: ${t}` : `ابحث بعمق عن: ${t}`;
     sendMessage();
   };
   $("btn-research-start").onclick = start;
@@ -887,6 +893,16 @@ const KIND_COLORS = {
   agent: "#a78bfa", memory: "#8b5cf6", lesson: "#34d399", file: "#60a5fa",
   chunk: "#38bdf8", tool: "#fbbf24", skill: "#f472b6", event: "#f87171",
 };
+/* 🐙 v2: memory nodes colored by their expert category */
+const CAT_COLORS = {
+  "شخصي": "#f472b6", "عمل": "#60a5fa", "تفضيلات": "#fbbf24",
+  "مشاريع": "#34d399", "أخرى": "#8b5cf6",
+};
+const CAT_AR = { "شخصي": "👤 شخصي", "عمل": "💼 عمل", "تفضيلات": "⭐ تفضيلات", "مشاريع": "🚀 مشاريع", "أخرى": "📦 أخرى" };
+function nodeColor(n) {
+  if (n.kind === "memory" && n.cat && CAT_COLORS[n.cat]) return CAT_COLORS[n.cat];
+  return KIND_COLORS[n.kind] || "#cbd5e1";
+}
 const KIND_AR = {
   agent: "الوكيل", memory: "ذاكرة دائمة", lesson: "درس مستخلص", file: "ملف تدريب",
   chunk: "مقطع معرفي", tool: "أداة", skill: "مهارة مدمجة", event: "حدث تعلّم",
@@ -1108,7 +1124,7 @@ function brainDraw(t) {
   ctx.lineWidth = 1 / Brain.scale;
   for (const [ai, bi] of Brain.edgeIdx) {
     const a = Brain.nodes[ai], b = Brain.nodes[bi];
-    const col = KIND_COLORS[b.kind] || "#8892b8";
+    const col = nodeColor(b);
     ctx.strokeStyle = col;
     ctx.globalAlpha = 0.34;
     ctx.beginPath();
@@ -1120,7 +1136,7 @@ function brainDraw(t) {
   // nodes
   const pulse = (Math.sin((t || 0) / 450) + 1) / 2;
   for (const nd of Brain.nodes) {
-    const col = KIND_COLORS[nd.kind] || "#cbd5e1";
+    const col = nodeColor(nd);
     ctx.shadowColor = col;
     ctx.shadowBlur = nd.kind === "agent" ? 26 + pulse * 14 : 12;
     ctx.fillStyle = col;
@@ -1167,9 +1183,11 @@ function startBrainLoop() {
 function wakeBrain() { Brain.still = 0; startBrainLoop(); }
 
 function openNodeSheet(n) {
+  const catLine = n.cat ? `<p><span class="bstat">🏷️ ${escapeHtml(CAT_AR[n.cat] || n.cat)}</span></p>` : "";
   openSheet(`
     <h2>${escapeHtml(n.icon)} ${escapeHtml(n.label)}</h2>
     <p><span class="bstat"><b>◉</b> ${KIND_AR[n.kind] || n.kind}</span></p>
+    ${catLine}
     <p style="font-size:15px;line-height:1.9;white-space:pre-wrap">${escapeHtml(n.detail || "لا تفاصيل إضافية.")}</p>`);
 }
 
@@ -1422,6 +1440,7 @@ async function loadDashboard() {
   } catch (e) { cards.innerHTML = `<div class="note err">${escapeHtml(errText(e))}</div>`; }
   loadLearnLog(); loadKnowledge(); loadTools(); loadReminders(); loadSkills();
   loadGaps(); initBackup(); loadResearchHistory(); loadTicker();
+  initQuickActions(); loadOctopusCard(); loadMindSummary();
 }
 
 function renderPerAgent(perAgent) {
@@ -1487,11 +1506,80 @@ async function loadTicker() {
       ).join('<span class="ticker-sep">✦</span>');
       ticker.innerHTML = `<div class="ticker-track">${html}<span class="ticker-sep">✦</span>${html}</div>`;
     }
-  } catch { /* keep previous content */ }
+  } catch {
+    ticker.innerHTML = '<span class="ticker-item">⚠️ تعذّر الاتصال بالخادم — تأكد من إتمام النشر على Cloudflare ثم أعد فتح التطبيق</span>';
+  }
   if (!tickerTimer) tickerTimer = setInterval(loadTicker, 30000);
 }
 
-/* Smart training suggestions from knowledge gaps */
+/* 🐙 Octopus live status card */
+function octopus() {
+  return state.agents.find((a) => a.isOctopus) || null;
+}
+const ARM_ICONS = {
+  calculator: "🧮", datetime: "🕐", currency: "💱", url_fetch: "🔗",
+  web_search: "🌐", reminder: "⏰", image_generate: "🎨", webhook: "📡",
+};
+async function loadOctopusCard() {
+  const status = $("octo-status"), arms = $("octo-arms");
+  if (!status) return;
+  const o = octopus();
+  if (!o) { status.textContent = "الأخطبوط غير موجود بعد."; return; }
+  arms.innerHTML = (o.tools || []).slice(0, 8)
+    .map((t) => `<span class="arm" title="${escapeHtml(t)}">${ARM_ICONS[t] || "🔧"}</span>`).join("");
+  try {
+    const { items } = await api("/api/activity");
+    const mine = (items || []).filter((i) => i.agentId === o.id);
+    const last = mine[0];
+    const today = new Date().toISOString().slice(0, 10);
+    const todayCount = mine.filter((i) => (i.at || "").slice(0, 10) === today).length;
+    status.innerHTML = last
+      ? `${escapeHtml(last.icon)} ${escapeHtml(last.text)} <span class="muted">— ${escapeHtml(last.agent)}</span>`
+      : "جاهز للعمل — اطلب أي شيء! 🐙";
+    if (todayCount) status.innerHTML += `<br><small class="muted">📈 ${todayCount} نشاط اليوم</small>`;
+  } catch {
+    status.textContent = "🐙 جاهز — اطلب أي شيء!";
+  }
+}
+
+/* 🪞 Mind summary: "who am I according to what you know about me" */
+async function loadMindSummary(force = false) {
+  const box = $("mind-summary");
+  if (!box) return;
+  const o = octopus();
+  if (!o) { box.innerHTML = '<p class="muted">لا يوجد أخطبوط بعد.</p>'; return; }
+  if (!force) box.innerHTML = '<div class="skel"></div>';
+  try {
+    const d = await api(`/api/mind/${o.id}`);
+    const cats = Object.entries(d.counts || {})
+      .map(([c, n]) => `<span class="bstat">${escapeHtml(c)}: <b>${n}</b></span>`).join("");
+    box.innerHTML = `<p style="white-space:pre-wrap;line-height:1.9">${escapeHtml(d.summary)}</p>
+      <div style="margin-top:8px">${cats}<span class="bstat">💡 <b>${d.lessons || 0}</b> درساً</span></div>`;
+  } catch {
+    box.innerHTML = '<p class="muted">تعذّر التحميل</p>';
+  }
+}
+
+/* Dashboard quick actions */
+function initQuickActions() {
+  const go = (id, view, fn) => {
+    const b = $(id);
+    if (!b || b.dataset.init) return;
+    b.dataset.init = "1";
+    b.onclick = () => { const o = octopus(); if (o) setChatAgent(o.id); showView(view); setTimeout(fn, 400); };
+  };
+  go("qa-research", "chat", () => { const t = $("chat-input"); if (t) { t.value = "ابحث بعمق عن: "; t.focus(); } });
+  go("qa-train", "chat", () => $("btn-train-open") && $("btn-train-open").click());
+  go("qa-image", "images", () => {});
+  go("qa-reminder", "chat", () => { const t = $("chat-input"); if (t) { t.value = "ذكّرني "; t.focus(); } });
+  const mr = $("btn-mind-refresh");
+  if (mr && !mr.dataset.init) {
+    mr.dataset.init = "1";
+    mr.onclick = () => loadMindSummary(true);
+  }
+}
+
+/* Smart training suggestions from knowledge gaps (prioritized by frequency) */
 async function loadGaps() {
   const box = $("dash-gaps");
   if (!box) return;
@@ -1506,14 +1594,17 @@ async function loadGaps() {
       const row = document.createElement("div");
       row.className = "gap-row";
       const info = document.createElement("div");
-      info.innerHTML = `<b></b><br><small class="muted"></small>`;
-      info.querySelector("b").textContent = `${g.avatar || "🤖"} ${g.agentName}`;
+      info.innerHTML = `<b></b> <span class="gap-count"></span><br><small class="muted"></small>`;
+      const names = (g.agents || []).map((a) => `${a.avatar || "🤖"} ${a.name}`).join("، ");
+      info.querySelector("b").textContent = names || "فجوة معرفية";
+      info.querySelector(".gap-count").textContent = g.count > 1 ? `×${g.count}` : "";
       info.querySelector("small").textContent = g.detail;
       const btn = document.createElement("button");
       btn.className = "btn small";
       btn.textContent = "📄 درّبه";
+      const targetId = (g.agents && g.agents[0] && g.agents[0].id) || state.currentAgent;
       btn.onclick = () => {
-        setChatAgent(g.agentId);
+        setChatAgent(targetId);
         showView("chat");
         setTimeout(() => $("btn-train-open").click(), 400);
       };
@@ -1798,21 +1889,23 @@ $("btn-save-pw").onclick = () => {
     state.config = await api("/api/config");
     initImageStudio();
     initNotifications();
-    await loadAgents();
-    if (!state.agents.length) {
-      try {
-        const { agent } = await api("/api/agents", {
-          method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({ name: "مساعدي الذكي", avatar: "🤖", description: "وكيل تجريبي جاهز", tone: "ودود ومختصر" }),
-        });
-        await loadAgents();
-        setChatAgent(agent.id);
-        setTimeout(() => toast("تم إنشاء وكيل تجريبي — جرّب محادثته! 🤖"), 800);
-      } catch { /* already have agents or failed silently */ }
-    } else if (state.currentAgent) {
-      setChatAgent(state.currentAgent);
-    }
-    showView("home");
+    await loadAgents(); // backend auto-provisions the 🐙 octopus on first call
+    // Default chat agent: the octopus first, then saved choice, then first agent
+    const octo = state.agents.find((a) => a.isOctopus);
+    if (octo) setChatAgent(octo.id);
+    else if (state.currentAgent) setChatAgent(state.currentAgent);
+    else if (state.agents.length) setChatAgent(state.agents[0].id);
+    showView("dashboard");
+    // First-launch welcome: meet your octopus 🐙
+    try {
+      if (!localStorage.getItem("octo_welcomed")) {
+        $("welcome").classList.remove("hidden");
+        $("btn-welcome").onclick = () => {
+          $("welcome").classList.add("hidden");
+          try { localStorage.setItem("octo_welcomed", "1"); } catch { /* ignore */ }
+        };
+      }
+    } catch { /* ignore */ }
   } catch (e) {
     document.querySelector("main").innerHTML =
       `<div class="note err">تعذّر الاتصال بالخادم: ${escapeHtml(errText(e))}<br><span class="muted">تأكد من إتمام النشر على Cloudflare.</span></div>`;
