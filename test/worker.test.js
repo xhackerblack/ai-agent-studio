@@ -2,11 +2,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import worker from "../src/worker.js";
+import worker, { __forceFlush } from "../src/worker.js";
+import { __resetUsageForTests } from "../src/usage.js";
 import { chunkText, cosine, retrieve, relevantChunks } from "../src/rag.js";
 import { BUILTIN_TOOLS, getBuiltinTool } from "../src/tools.js";
 import { transcriptFor } from "../src/learn.js";
 import { chatNeurons, embeddingNeurons, getChatModel, DEFAULT_CHAT_MODEL } from "../src/models.js";
+import { beforeEach } from "node:test";
+
+beforeEach(() => __resetUsageForTests());
 
 /* ---------- mocks ---------- */
 
@@ -22,6 +26,8 @@ function mockKV() {
 function mockEnv(aiRun) {
   return {
     AI: { run: aiRun },
+    APP_PASSWORD: "test-secret",
+    INTERNAL_TOKEN: "test-internal",
     STUDIO_KV: {
       _m: new Map(),
       async get(k, t) {
@@ -43,8 +49,11 @@ function mockEnv(aiRun) {
 }
 
 async function api(env, path, opts = {}) {
-  const req = new Request(`https://x.test${path}`, opts);
-  return worker.fetch(req, env, {});
+  // Internal token bypasses the session gate in unit tests (auth is covered in auth.test.js).
+  const headers = { "x-internal-token": "test-internal", ...(opts.headers || {}) };
+  const res = await worker.fetch(new Request(`https://x.test${path}`, { ...opts, headers }), env, {});
+  await __forceFlush(env); // make batched counters visible to subsequent reads
+  return res;
 }
 async function postJson(env, path, body) {
   return api(env, path, {
