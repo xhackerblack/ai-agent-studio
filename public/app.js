@@ -195,7 +195,7 @@ async function loadAgents() {
 
 function fillAgentSelects() {
   const opts = state.agents.map((a) => `<option value="${a.id}">${a.avatar} ${escapeHtml(a.name)}</option>`).join("");
-  for (const id of ["chat-agent", "learn-agent", "know-agent", "rem-agent", "mem-agent", "brain-agent"]) {
+  for (const id of ["chat-agent", "learn-agent", "know-agent", "rem-agent", "mem-agent", "brain-agent", "research-agent"]) {
     const el = $(id);
     if (el) {
       const cur = el.value;
@@ -643,10 +643,14 @@ async function sendMessage() {
         if (obj.type === "token") {
           if (first) {
             first = false;
-            // Clear the typing indicator but keep the thinking box
+            // Clear the typing indicator but keep the thinking box and research map
             const th = botEl._thinkEl || null;
+            const rm = botEl._researchEl || null;
             botEl.textContent = "";
             if (th) botEl.appendChild(th);
+            if (rm) botEl.appendChild(rm);
+            botEl._thinkEl = th;
+            botEl._researchEl = rm;
             const s = document.createElement("span");
             botEl.appendChild(s);
             botEl._textEl = s;
@@ -657,6 +661,7 @@ async function sendMessage() {
         }
         else if (obj.type === "tool") { $("chat-tools").textContent = `🔧 يستخدم: ${obj.icon} ${obj.label}…`; }
         else if (obj.type === "thinking") { handleThinkingEvent(botEl, obj); }
+        else if (obj.type === "research") { handleResearchEvent(botEl, obj); }
         else if (obj.type === "conversation") { state.currentConv = obj.id; }
         else if (obj.type === "done") {
           for (const id of obj.images || []) {
@@ -676,7 +681,7 @@ async function sendMessage() {
         else if (obj.type === "error") throw Object.assign(new Error(obj.code || "upstream"), { code: obj.code, detail: obj.detail || "" });
       }
     }
-    if (!full && !botEl._thinkEl) botEl.innerHTML = '<span class="muted">رد فارغ — حاول مجدداً</span>';
+    if (!full && !botEl._thinkEl && !botEl._researchEl) botEl.innerHTML = '<span class="muted">رد فارغ — حاول مجدداً</span>';
     $("chat-tools").textContent = "";
     loadConversations();
   } catch (e) {
@@ -703,6 +708,125 @@ $("btn-learn-now").onclick = async () => {
 };
 
 /* Training sheet */
+/* Deep research: topic sheet */
+$("btn-research-open").onclick = () => {
+  const agent = state.agents.find((a) => a.id === state.currentAgent);
+  if (!agent) {
+    toast("أنشئ وكيلاً أولاً من تبويب الوكلاء 🤖", true);
+    showView("agents");
+    return;
+  }
+  openSheet(`
+    <h2>🔬 بحث معمق</h2>
+    <p class="muted">سيبحث الوكيل <b>${agent.avatar} ${escapeHtml(agent.name)}</b> في قاعدة معرفته أولاً،
+    ثم في الويب إن لزم، ويلخّص ويحلّل — ويحفظ الدروس في عقله.</p>
+    <input id="research-topic" placeholder="موضوع البحث… (مثال: أسعار الذهب اليوم)">
+    <button class="btn primary big" id="btn-research-start">🔬 ابدأ البحث</button>`);
+  const start = () => {
+    const t = $("research-topic").value.trim();
+    if (!t) return toast("اكتب موضوع البحث أولاً", true);
+    closeSheet();
+    $("chat-text").value = `ابحث بعمق عن: ${t}`;
+    sendMessage();
+  };
+  $("btn-research-start").onclick = start;
+  $("research-topic").onkeydown = (e) => { if (e.key === "Enter") start(); };
+  setTimeout(() => $("research-topic").focus(), 300);
+};
+
+/* Deep research: live map card */
+const RESEARCH_STAGES = {
+  kb: { icon: "📚", label: "قاعدة المعرفة" },
+  web: { icon: "🌐", label: "الويب" },
+  analyze: { icon: "📊", label: "التلخيص والتحليل" },
+  learn: { icon: "🧠", label: "التعلّم والحفظ" },
+};
+
+function researchMap(botEl) {
+  let map = botEl._researchEl;
+  if (!map) {
+    map = document.createElement("div");
+    map.className = "research-map";
+    map.innerHTML = '<div class="rm-head">🔬 <span class="rm-query"></span></div><div class="rm-stages"></div>';
+    map._rows = {};
+    botEl.prepend(map);
+    botEl._researchEl = map;
+  }
+  return map;
+}
+
+function researchRow(map, stage) {
+  if (!map._rows[stage]) {
+    const meta = RESEARCH_STAGES[stage] || { icon: "•", label: stage };
+    const row = document.createElement("div");
+    row.className = "rm-row";
+    row.innerHTML = '<span class="rm-status">⏳</span><span class="rm-icon"></span><span class="rm-label"></span><span class="rm-detail"></span>';
+    row.querySelector(".rm-icon").textContent = meta.icon;
+    row.querySelector(".rm-label").textContent = meta.label;
+    map.querySelector(".rm-stages").appendChild(row);
+    map._rows[stage] = row;
+  }
+  return map._rows[stage];
+}
+
+function handleResearchEvent(botEl, obj) {
+  const map = researchMap(botEl);
+  const scroll = () => { const l = $("chat-log"); if (l) l.scrollTop = l.scrollHeight; };
+  if (obj.stage === "start") {
+    map.querySelector(".rm-query").textContent = `بحث معمق: ${obj.query || ""}`;
+    scroll();
+    return;
+  }
+  if (obj.stage === "fetch") {
+    const row = researchRow(map, "web");
+    row.querySelector(".rm-status").textContent = "⏳";
+    row.querySelector(".rm-detail").textContent = `يقرأ: ${(obj.title || "").slice(0, 40)}…`;
+    scroll();
+    return;
+  }
+  if (obj.stage === "done") {
+    map.classList.add("done");
+    map.querySelector(".rm-head").insertAdjacentHTML("beforeend", ' <span class="rm-badge">✅ اكتمل</span>');
+    scroll();
+    return;
+  }
+  const row = researchRow(map, obj.stage);
+  const st = row.querySelector(".rm-status");
+  const dt = row.querySelector(".rm-detail");
+  if (obj.state === "start") {
+    st.textContent = "⏳";
+    dt.textContent = "جارٍ…";
+  } else if (obj.state === "done") {
+    st.textContent = "✅";
+    if (obj.stage === "kb") {
+      const files = (obj.files || []).join("، ");
+      dt.textContent = obj.hits ? `${obj.hits} نتائج${files ? ` — ${files}` : ""}` : "لا نتائج";
+    } else if (obj.stage === "web") {
+      const n = (obj.sources || []).length;
+      dt.textContent = n ? `${n} مصادر` : "لا مصادر جديدة";
+      if (n && !row.querySelector(".rm-chips")) {
+        const chips = document.createElement("div");
+        chips.className = "rm-chips";
+        for (const s of obj.sources.slice(0, 4)) {
+          const a = document.createElement("a");
+          a.href = s.url; a.target = "_blank"; a.rel = "noopener";
+          a.className = "rm-chip";
+          a.textContent = `🔗 ${(s.title || s.url).slice(0, 32)}`;
+          chips.appendChild(a);
+        }
+        row.appendChild(chips);
+      }
+    } else if (obj.stage === "learn") {
+      dt.textContent = obj.lessons ? `حُفظت ${obj.lessons} دروس في العقل 🧠` : "اكتمل";
+    } else {
+      dt.textContent = "اكتمل";
+    }
+  } else if (obj.state === "skipped") {
+    st.textContent = "⏭️";
+    dt.textContent = "المعرفة الداخلية كافية";
+  }
+  scroll();
+}
 $("btn-train-open").onclick = () => {
   const agent = state.agents.find((a) => a.id === state.currentAgent);
   if (!agent) {
@@ -1278,7 +1402,7 @@ async function loadDashboard() {
     renderPerAgent(s.perAgent);
   } catch (e) { cards.innerHTML = `<div class="note err">${escapeHtml(errText(e))}</div>`; }
   loadLearnLog(); loadKnowledge(); loadTools(); loadReminders(); loadSkills();
-  loadGaps(); initBackup();
+  loadGaps(); initBackup(); loadResearchHistory();
 }
 
 function renderPerAgent(perAgent) {
@@ -1298,6 +1422,35 @@ function renderPerAgent(perAgent) {
     row.children[1].textContent = `${r.messages} رسالة`;
     box.appendChild(row);
   }
+}
+
+/* Research history */
+async function loadResearchHistory() {
+  const sel = $("research-agent");
+  const id = (sel && sel.value) || state.currentAgent;
+  if (!id) return;
+  const box = $("research-list");
+  try {
+    const { research } = await api(`/api/research/${id}`);
+    if (!research.length) {
+      box.innerHTML = '<p class="muted">لا بحوث بعد — ابدأ واحداً من زر «🔬 بحث معمق» في المحادثة.</p>';
+      return;
+    }
+    box.innerHTML = "";
+    for (const r of research.slice(0, 10)) {
+      const d = document.createElement("button");
+      d.className = "rs-row";
+      d.innerHTML = `<div class="rs-q"></div><small class="muted"></small>`;
+      d.querySelector(".rs-q").textContent = `🔬 ${r.query}`;
+      d.querySelector("small").textContent =
+        `${new Date(r.at).toLocaleString("ar")} — 📚 ${r.kbHits} معرفة، 🌐 ${r.webSources} ويب، 🧠 ${r.lessons} دروس`;
+      d.onclick = () => openSheet(`
+        <h2>🔬 ${escapeHtml(r.query)}</h2>
+        <p class="muted">${new Date(r.at).toLocaleString("ar")}</p>
+        <p style="white-space:pre-wrap">${escapeHtml(r.summary || "")}</p>`);
+      box.appendChild(d);
+    }
+  } catch { box.innerHTML = '<p class="muted">تعذّر التحميل</p>'; }
 }
 
 /* Smart training suggestions from knowledge gaps */
@@ -1405,7 +1558,7 @@ async function loadLearnLog() {
     const { events } = await api(`/api/learning-log/${id}`);
     const box = $("learn-log");
     box.innerHTML = events.length ? "" : '<p class="muted">لا أحداث بعد — تحدث مع الوكيل ثم اضغط "🧠 اجعله يتعلم".</p>';
-    const names = { memory: "🧠 ذاكرة", lesson: "💡 درس", gap: "❓ فجوة", training: "📄 تدريب" };
+    const names = { memory: "🧠 ذاكرة", lesson: "💡 درس", gap: "❓ فجوة", training: "📄 تدريب", quality: "⭐ جودة", research: "🔬 بحث" };
     for (const e of events.slice(0, 40)) {
       const d = document.createElement("div");
       d.className = "tl-item";
@@ -1416,6 +1569,7 @@ async function loadLearnLog() {
   } catch (e) { toast(errText(e), true); }
 }
 $("learn-agent").onchange = loadLearnLog;
+$("research-agent").onchange = loadResearchHistory;
 
 async function loadKnowledge() {
   const id = $("know-agent").value || state.currentAgent;
