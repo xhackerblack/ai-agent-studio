@@ -1,9 +1,39 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="110" fill="#1a1033"/>
-  <rect x="64" y="130" width="384" height="320" rx="80" fill="#6c3df4"/>
-  <line x1="256" y1="130" x2="256" y2="64" stroke="#9d7bff" stroke-width="18" stroke-linecap="round"/>
-  <circle cx="256" cy="52" r="26" fill="#9d7bff"/>
-  <circle cx="186" cy="270" r="30" fill="#ffffff"/>
-  <circle cx="326" cy="270" r="30" fill="#ffffff"/>
-  <rect x="196" y="350" width="120" height="22" rx="11" fill="#ffffff" opacity="0.85"/>
+  <defs>
+    <radialGradient id="sea" cx="50%" cy="35%" r="80%">
+      <stop offset="0%" stop-color="#2b1a5e"/>
+      <stop offset="100%" stop-color="#120b2e"/>
+    </radialGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="110" fill="url(#sea)"/>
+  <!-- bubbles -->
+  <circle cx="120" cy="120" r="14" fill="#ffffff" opacity="0.18"/>
+  <circle cx="392" cy="100" r="9" fill="#ffffff" opacity="0.22"/>
+  <circle cx="350" cy="160" r="6" fill="#ffffff" opacity="0.15"/>
+  <!-- arms -->
+  <g stroke="#8b5cf6" stroke-width="34" stroke-linecap="round" fill="none">
+    <path d="M150 300 C 110 350, 130 420, 180 440"/>
+    <path d="M362 300 C 402 350, 382 420, 332 440"/>
+    <path d="M185 330 C 160 390, 180 440, 225 452"/>
+    <path d="M327 330 C 352 390, 332 440, 287 452"/>
+  </g>
+  <!-- head -->
+  <ellipse cx="256" cy="230" rx="105" ry="120" fill="url(#body)"/>
+  <!-- eyes -->
+  <circle cx="215" cy="215" r="30" fill="#fff"/>
+  <circle cx="297" cy="215" r="30" fill="#fff"/>
+  <circle cx="220" cy="220" r="14" fill="#1a1033"/>
+  <circle cx="292" cy="220" r="14" fill="#1a1033"/>
+  <circle cx="224" cy="215" r="5" fill="#fff"/>
+  <circle cx="296" cy="215" r="5" fill="#fff"/>
+  <!-- smile -->
+  <path d="M232 280 Q 256 296 280 280" stroke="#3b1d7a" stroke-width="10" stroke-linecap="round" fill="none"/>
+  <!-- circuit dots on head (the "AI" touch) -->
+  <circle cx="256" cy="130" r="7" fill="#22d3ee"/>
+  <circle cx="200" cy="150" r="5" fill="#22d3ee" opacity="0.8"/>
+  <circle cx="312" cy="150" r="5" fill="#22d3ee" opacity="0.8"/>
 </svg>
