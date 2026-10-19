@@ -189,10 +189,14 @@
   <!-- SETTINGS -->
   <section class="view" id="view-settings" data-title="⚙️ الإعدادات">
     <div class="card">
-      <h3>🔐 كلمة مرور التطبيق</h3>
-      <p class="muted">إن عيّنتها على الخادم (APP_PASSWORD) أدخلها هنا لحفظها على هذا الجهاز.</p>
-      <input id="set-password" type="password" placeholder="كلمة المرور" dir="ltr" autocomplete="current-password">
-      <button class="btn block" id="btn-save-pw">حفظ على هذا الجهاز</button>
+      <h3>🛡️ الأمان والحصة</h3>
+      <div id="usage-box"><div class="note">جارٍ تحميل الحصة…</div></div>
+      <label class="muted" for="set-cap">السقف اليومي للخلايا العصبية (الرقم تقديري):</label>
+      <div class="row"><input id="set-cap" type="number" min="1000" max="100000" step="500" style="flex:1;margin:0" dir="ltr"><button class="btn" id="btn-save-cap">حفظ</button></div>
+      <label class="row" style="margin-top:10px;align-items:center"><input type="checkbox" id="set-research-on" style="width:auto;margin:0"> <span>الباحث المستقل مفعّل</span></label>
+      <label class="muted" for="set-research-every" style="margin-top:8px">فترة الباحث المستقل:</label>
+      <select id="set-research-every"><option value="3">كل 3 ساعات</option><option value="6">كل 6 ساعات</option><option value="12">كل 12 ساعة</option><option value="24">يوميًا</option></select>
+      <button class="btn block" id="btn-logout" style="margin-top:10px">🚪 تسجيل الخروج</button>
     </div>
     <div class="card">
       <h3>💾 الذاكرة الدائمة</h3>
@@ -243,6 +247,19 @@
       <li>📡 <b>باحث مستقل</b> — يتعلم من الويب كل ٣٠ دقيقة</li>
     </ul>
     <button class="btn primary big block" id="btn-welcome">🚀 ابدأ</button>
+  </div>
+</div>
+
+<!-- Login gate (shown once when the session is missing/expired) -->
+<div id="login-screen" class="hidden" style="position:fixed;inset:0;background:#101418;z-index:200;display:flex;align-items:center;justify-content:center;padding:20px">
+  <div class="card" style="width:100%;max-width:380px;text-align:center">
+    <div style="font-size:48px">🐙</div>
+    <h3>تسجيل الدخول</h3>
+    <p class="muted">أدخل كلمة مرور التطبيق</p>
+    <input id="login-password" type="password" placeholder="كلمة المرور" dir="ltr" autocomplete="current-password">
+    <button class="btn primary big block" id="btn-login" style="margin-top:10px">دخول</button>
+    <div id="login-err" class="note err hidden" style="margin-top:10px"></div>
+    <div id="login-setup" class="note hidden" style="margin-top:10px"></div>
   </div>
 </div>
 
