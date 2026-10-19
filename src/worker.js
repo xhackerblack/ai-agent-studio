@@ -18,6 +18,10 @@ import {
   evaluateAndLearn, getImageLessons, buildLearnSuffix, EVAL_CRITERIA,
 } from "./imagelab.js";
 import {
+  NICHES, getNiche, nicheKeyOf, detectNicheHeuristic, analyzeNiche, refinePrompt,
+  buildFinalPrompt, preflightCheck, fixPrompt, extractStyleDNA, styleFromImage,
+} from "./niche.js";
+import {
   newAgentId, defaultAgent, listAgents, getAgent, saveAgent,
   deleteAgent, quickCustomize, ensureOctopus, OCTOPUS_SYSTEM,
 } from "./agents.js";
@@ -257,25 +261,98 @@ async function generateImage(env, prompt, modelId) {
 }
 
 /**
- * Smart generation: injects lessons learned from the agent's own past image
- * evaluations into the prompt, then runs the vision self-critique pipeline
- * (evaluateAndLearn) so every image teaches the next one.
+ * Niche-intelligent prompt planning: detect niche → refine keywords into a
+ * real description → attach the tested style block → pre-flight validate.
+ * preAnalyzed: {niche, subject, refined} from the studio's two-step UI.
  */
-async function generateImageSmart(env, kvH, agent, prompt, modelId) {
-  const original = String(prompt || "").trim();
-  let lessons = [];
-  try {
-    lessons = agent ? await getImageLessons(kvH, agent.id, 3) : [];
-  } catch { /* lessons are best-effort */ }
-  const enriched = original + buildLearnSuffix(lessons);
-  const { id, url, b64 } = await generateImage(env, enriched, modelId);
-  let evaluation = { evaluated: false, reason: "pending" };
-  try {
-    evaluation = await evaluateAndLearn(env, kvH, agent, id, original, b64);
-  } catch (e) {
-    evaluation = { evaluated: false, reason: String((e && e.message) || e || "eval-error").slice(0, 120) };
+async function planImagePrompt(env, kvH, agent, rawText, preAnalyzed) {
+  const raw = String(rawText || "").trim();
+  let key = preAnalyzed && NICHES[preAnalyzed.niche] ? preAnalyzed.niche : null;
+  let subject = (preAnalyzed && preAnalyzed.subject) || "";
+  let refined = (preAnalyzed && preAnalyzed.refined) || "";
+  if (!key) {
+    try {
+      const a = await analyzeNiche(env, raw);
+      key = a.key; subject = a.subject;
+    } catch {
+      key = detectNicheHeuristic(raw); subject = raw.slice(0, 120);
+    }
   }
-  return { id, url, model: getImageModel(modelId).id, evaluation };
+  key = nicheKeyOf(key);
+  if (!refined) {
+    try { refined = await refinePrompt(env, raw, key); }
+    catch { refined = raw.slice(0, 300) || "a cozy scene"; }
+  }
+  let lessons = [];
+  try { lessons = agent ? await getImageLessons(kvH, agent.id, 4) : []; } catch { /* best-effort */ }
+  let template = null;
+  try { template = (await kvH.get(`nichetemplate:${key}`))?.prompt || null; } catch { /* best-effort */ }
+  let final = buildFinalPrompt({ refined, nicheKey: key, lessons, template });
+  const check = preflightCheck(final, key);
+  if (!check.ok) final = fixPrompt(final, key, check);
+  return { nicheKey: key, subject: subject || refined.slice(0, 80), refined, final };
+}
+
+/**
+ * Smart generation: niche-intelligent prompt planning, generation, vision
+ * self-critique with a strict style gate, ONE regeneration on style failure,
+ * template memory for successful niches.
+ */
+async function generateImageSmart(env, kvH, agent, prompt, modelId, opts = {}) {
+  const original = String(prompt || "").trim();
+  const plan = await planImagePrompt(env, kvH, agent, original, opts.preAnalyzed);
+  const gen = (p) => generateImage(env, p, modelId);
+  let r = await gen(plan.final);
+  let evaluation = { evaluated: false, reason: "pending" };
+  let regenerated = false;
+  const doEval = agent && agent.imageLearn !== false;
+  if (doEval) {
+    try {
+      evaluation = await evaluateAndLearn(env, kvH, agent, r.id, plan.refined, r.b64, plan.nicheKey);
+    } catch (e) {
+      evaluation = { evaluated: false, reason: String((e && e.message) || e || "eval-error").slice(0, 120) };
+    }
+    // Strict gate → exactly one regeneration with an explicit correction.
+    const failed = evaluation.evaluated &&
+      (evaluation.overall < 3 || (evaluation.scores && evaluation.scores.styleMatch <= 2));
+    if (failed && !opts.retried) {
+      const issues = (evaluation.issues || []).join("; ").slice(0, 300);
+      const fixed = plan.final +
+        `\n\n[CRITICAL CORRECTION: the previous attempt FAILED${issues ? ` (${issues})` : ""}. ` +
+        `Regenerate now, strictly obeying the style block above.]`;
+      r = await gen(fixed);
+      regenerated = true;
+      try {
+        evaluation = await evaluateAndLearn(env, kvH, agent, r.id, plan.refined, r.b64, plan.nicheKey);
+      } catch { /* keep first evaluation */ }
+    }
+    if (regenerated) evaluation.regenerated = true;
+    // Template memory: remember winning prompts per niche.
+    if (evaluation.evaluated && evaluation.overall >= 4) {
+      try {
+        await kvH.set(`nichetemplate:${plan.nicheKey}`, {
+          prompt: plan.refined, at: new Date().toISOString(), score: evaluation.overall,
+        });
+      } catch { /* best-effort */ }
+    }
+  }
+  // Niche log → Brain 🧬 nodes.
+  if (agent) {
+    try {
+      const nk = `nichelog:${agent.id}`;
+      const nl = (await kvH.get(nk)) || [];
+      nl.push({
+        at: new Date().toISOString(), niche: plan.nicheKey, subject: plan.subject,
+        overall: evaluation.overall ?? null, imageId: r.id,
+      });
+      await kvH.set(nk, nl.slice(-40));
+    } catch { /* best-effort */ }
+  }
+  const n = getNiche(plan.nicheKey);
+  return {
+    id: r.id, url: r.url, model: getImageModel(modelId).id, evaluation,
+    niche: { key: plan.nicheKey, label: n.label, icon: n.icon, subject: plan.subject, refined: plan.refined },
+  };
 }
 
 /** Re-run the vision self-critique for an image whose analysis failed/missing. */
@@ -299,10 +376,134 @@ async function handleImageEvalRetry(request, env, kvH, imageId) {
     if (hit) prompt = hit.prompt;
   }
   try {
-    const evaluation = await evaluateAndLearn(env, kvH, agent, imageId, prompt, btoa(bin));
+    const evaluation = await evaluateAndLearn(env, kvH, agent, imageId, prompt, btoa(bin), prev.niche || null);
     return json({ evaluation });
   } catch (e) {
     return json({ code: "upstream", message: "تعذّر تحليل الصورة", detail: errDetail(e) }, 502);
+  }
+}
+
+/* ---------------- niche intelligence ---------------- */
+
+/** POST /api/niche/analyze — detect niche + refine prompt, before generation. */
+async function handleNicheAnalyze(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const text = String(body.text || "").trim();
+  if (!text) return json({ code: "bad", message: "النص مطلوب" }, 400);
+  try {
+    const a = await analyzeNiche(env, text);
+    const key = nicheKeyOf(a.key);
+    const refined = await refinePrompt(env, text, key);
+    const final = buildFinalPrompt({ refined, nicheKey: key });
+    const check = preflightCheck(final, key);
+    const n = getNiche(key);
+    return json({
+      niche: key, label: n.label, icon: n.icon, palette: n.palette,
+      subject: a.subject, refined,
+      finalPreview: check.ok ? final : fixPrompt(final, key, check),
+      check,
+    });
+  } catch (e) {
+    return json({ code: "upstream", message: "تعذّر تحليل النيتش", detail: errDetail(e) }, 502);
+  }
+}
+
+/** POST /api/niche/research — web research on the niche → style DNA lessons. */
+async function handleNicheResearch(request, env, kvH) {
+  const body = await request.json().catch(() => ({}));
+  const agentId = String(body.agentId || "");
+  const key = nicheKeyOf(body.niche);
+  const subject = String(body.subject || "").slice(0, 120);
+  const agent = agentId ? await getAgent(kvH, agentId).catch(() => null) : null;
+  if (!agent) return json({ code: "not-found", message: "الوكيل غير موجود" }, 404);
+  const n = getNiche(key);
+  try {
+    const searchTool = getBuiltinTool("web_search");
+    const fetchTool = getBuiltinTool("url_fetch");
+    const query = `${subject || n.label} ${key === "general" ? "" : "coloring book"} style elements what makes a good page`.trim();
+    const sres = await searchTool.run({ query }, { fetch }).catch(() => ({ results: [] }));
+    const snippets = [];
+    for (const r of (sres.results || []).slice(0, 4)) {
+      snippets.push(`${r.title || ""} — ${r.snippet || r.url || ""}`);
+      if (r.url) {
+        try {
+          const f = await fetchTool.run({ url: r.url }, { fetch });
+          if (f && f.text) snippets.push(`[${r.url}] ${String(f.text).slice(0, 1500)}`);
+        } catch { /* best-effort per source */ }
+      }
+      if (snippets.join("\n").length > 6000) break;
+    }
+    const dna = await extractStyleDNA(env, key, subject || n.label, snippets);
+    const now = new Date().toISOString();
+    const saved = [];
+    if (dna.lesson) {
+      const insKey = `learned:${agent.id}`;
+      const learned = (await kvH.get(insKey)) || [];
+      learned.push({ at: now, text: dna.lesson, source: "niche-research", niche: key });
+      await kvH.set(insKey, learned.slice(-60));
+      saved.push(dna.lesson);
+    }
+    for (const a of (dna.avoid || []).slice(0, 2)) {
+      const insKey = `learned:${agent.id}`;
+      const learned = (await kvH.get(insKey)) || [];
+      learned.push({ at: now, text: `تجنّب في نيتش ${n.label}: ${a}`, source: "niche-research", niche: key });
+      await kvH.set(insKey, learned.slice(-60));
+      saved.push(`تجنّب: ${a}`);
+    }
+    if (saved.length) {
+      const logKey = `learn:${agent.id}`;
+      const log = (await kvH.get(logKey)) || [];
+      log.push({ at: now, event: "lesson", detail: `🔍 بحث نيتش ${n.icon} ${n.label}: حُفظ ${saved.length} دروس أسلوب` });
+      await kvH.set(logKey, log.slice(-200));
+    }
+    return json({ dna, lessonsSaved: saved.length, sources: (sres.results || []).length });
+  } catch (e) {
+    return json({ code: "upstream", message: "تعذّر بحث النيتش", detail: errDetail(e) }, 502);
+  }
+}
+
+/** POST /api/niche/style-from-image — vision-extract style DNA → saved as a Skill. */
+async function handleStyleFromImage(request, env, kvH) {
+  const body = await request.json().catch(() => ({}));
+  const agentId = String(body.agentId || "");
+  const name = String(body.name || "").trim().slice(0, 60) || "أسلوب مرجعي";
+  const imageB64 = String(body.imageB64 || "");
+  if (!imageB64) return json({ code: "bad", message: "الصورة مطلوبة" }, 400);
+  const agent = agentId ? await getAgent(kvH, agentId).catch(() => null) : null;
+  if (!agent) return json({ code: "not-found", message: "الوكيل غير موجود" }, 404);
+  try {
+    const dna = await styleFromImage(env, imageB64);
+    const instructions =
+      `أسلوب بصري مستخلص من صورة مرجعية (${dna.styleName}).\n` +
+      `اللوحة: ${dna.palette === "bw" ? "أسود وأبيض" : "ملوّنة"}. ` +
+      `الخطوط: ${dna.lineWeight || "—"}. ` +
+      `الزخارف: ${(dna.motifs || []).join("، ") || "—"}.\n` +
+      `اتبع هذه التعليمات عند التوليد بهذا الأسلوب:\n${dna.instructions}`;
+    const skill = {
+      id: "sk_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+      name: `🎨 ${name}`,
+      icon: "🎨",
+      instructions: instructions.slice(0, 4000),
+      createdAt: new Date().toISOString(),
+    };
+    await kvH.set(`skill:${skill.id}`, skill);
+    const ids = (await kvH.get("skills:index")) || [];
+    ids.unshift(skill.id);
+    await kvH.set("skills:index", ids.slice(0, 100));
+    // auto-attach to the agent so the style is used immediately
+    const skillIds = Array.isArray(agent.skillIds) ? agent.skillIds : [];
+    if (!skillIds.includes(skill.id)) {
+      agent.skillIds = [...skillIds, skill.id].slice(0, 12);
+      await saveAgent(kvH, agent);
+    }
+    const now = new Date().toISOString();
+    const logKey = `learn:${agent.id}`;
+    const log = (await kvH.get(logKey)) || [];
+    log.push({ at: now, event: "lesson", detail: `🎨 استُخلص أسلوب جديد من صورة مرجعية: ${skill.name}` });
+    await kvH.set(logKey, log.slice(-200));
+    return json({ skill }, 201);
+  } catch (e) {
+    return json({ code: "upstream", message: "تعذّر استخلاص الأسلوب", detail: errDetail(e) }, 502);
   }
 }
 
@@ -315,9 +516,11 @@ async function handleGenerateImage(request, env, kvH) {
     try { agent = await getAgent(kvH, String(body.agentId)); } catch { /* optional */ }
   }
   try {
-    const r = await generateImageSmart(env, kvH, agent, prompt, body.model);
+    const r = await generateImageSmart(env, kvH, agent, prompt, body.model, {
+      preAnalyzed: body.niche ? { niche: body.niche, subject: body.subject, refined: body.refined } : null,
+    });
     await bumpStat(kvH, "images");
-    return json({ id: r.id, url: r.url, model: r.model, evaluation: r.evaluation }, 201);
+    return json({ id: r.id, url: r.url, model: r.model, evaluation: r.evaluation, niche: r.niche }, 201);
   } catch (e) {
     if (isQuotaError(e)) return json({ code: "quota", message: "نفدت الحصة اليومية" }, 429);
     return json({ code: "upstream", message: "تعذّر توليد الصورة", detail: errDetail(e) }, 502);
@@ -1269,6 +1472,23 @@ async function handleBrain(kvH, agentId) {
     add(id, (e.detail || "").slice(0, 42), "event", evIcon[e.event] || "✨", e.detail);
     link(A, id);
   }
+  // 🧬 Niche nodes: group generated images by their detected niche.
+  const nicheNodeIds = {};
+  try {
+    const nichelog = (await kvH.get(`nichelog:${agent.id}`)) || [];
+    const byNiche = {};
+    for (const nl of nichelog) {
+      const k = nicheKeyOf(nl.niche);
+      (byNiche[k] = byNiche[k] || []).push(nl);
+    }
+    for (const [nk, items] of Object.entries(byNiche)) {
+      const nd = getNiche(nk);
+      const nid = `nch${i++}`;
+      nicheNodeIds[nk] = nid;
+      add(nid, `${nd.label} ×${items.length}`, "niche", "🧬", `نيتش ${nd.label}: ${items.length} صور مولدة`);
+      link(A, nid);
+    }
+  } catch { /* brain must never break */ }
   // 🖼️ Image self-learning: generated images + their vision evaluations.
   // This is where the user SEES the model training on each image.
   const imglog = (await kvH.get(`imglog:${agent.id}`)) || [];
@@ -1277,6 +1497,8 @@ async function handleBrain(kvH, agentId) {
     const score = im.overall != null ? ` — ⭐ ${im.overall}/5` : " — بانتظار التقييم";
     add(iid, (im.prompt || "صورة مولدة").slice(0, 40), "image", "🖼️", `صورة مولدة: ${(im.prompt || "").slice(0, 120)}${score}`);
     link(A, iid);
+    const nk = nicheKeyOf(im.niche);
+    if (nicheNodeIds[nk]) link(iid, nicheNodeIds[nk]);
     if (lessonNodeByImage[im.id]) link(iid, lessonNodeByImage[im.id]);
     const ev = await kvH.get(`imgeval:${im.id}`);
     if (ev && ev.evaluated) {
@@ -1568,6 +1790,17 @@ export default {
         const ev = await kvH.get(`imgeval:${mEval[1]}`);
         if (!ev) return json({ code: "not-found", message: "لا يوجد تقييم لهذه الصورة" }, 404);
         return json({ evaluation: ev, criteria: EVAL_CRITERIA });
+      }
+
+      // Niche intelligence endpoints
+      if (path === "/api/niche/analyze" && request.method === "POST") {
+        return handleNicheAnalyze(request, env);
+      }
+      if (path === "/api/niche/research" && request.method === "POST") {
+        return handleNicheResearch(request, env, kvH);
+      }
+      if (path === "/api/niche/style-from-image" && request.method === "POST") {
+        return handleStyleFromImage(request, env, kvH);
       }
 
       if (path === "/api/agents") return handleAgents(request, kvH, url);
