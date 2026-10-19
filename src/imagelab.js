@@ -7,7 +7,8 @@
 /** Vision model used to "see" and critique generated images. */
 export const VISION_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct";
 // NOTE: vision neuron cost varies with image size; it counts against the
-// daily Workers AI quota. No hard-coded rate is claimed here.
+// daily Workers AI quota. A rough estimate is recorded for quota guarding.
+import { recordVisionNeurons } from "./usage.js";
 
 export const EVAL_CRITERIA = [
   { key: "composition", label: "التكوين", hint: "hero subject fills the frame, no empty voids, balanced layout" },
@@ -100,6 +101,7 @@ export async function analyzeImage(env, imageB64, prompt, nicheKey) {
     prompt: buildEvalPrompt(prompt, nicheKey),
     max_tokens: 900,
   });
+  recordVisionNeurons();
   const text = typeof out?.response === "string" ? out.response : "";
   if (!text.trim()) throw new Error("empty vision response");
   return safeParseEval(text);
