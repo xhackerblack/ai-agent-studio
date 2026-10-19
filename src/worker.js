@@ -122,6 +122,10 @@ async function handleAgents(req, kvH, url) {
       tools: Array.isArray(body.tools) ? body.tools.filter((t) => getBuiltinTool(t)).slice(0, 8) : ["calculator", "datetime"],
       skillIds: Array.isArray(body.skillIds) ? body.skillIds.map(String).slice(0, 12) : [],
       autoLearn: !!body.autoLearn,
+      autoResearch: !!body.autoResearch,
+      researchTopics: Array.isArray(body.researchTopics)
+        ? body.researchTopics.map((t) => String(t).slice(0, 200)).filter(Boolean).slice(0, 10)
+        : [],
       deepThink: !!body.deepThink,
       effort: ["fast", "balanced", "deep"].includes(body.effort) ? body.effort : "balanced",
       expertise: String(body.expertise || "").slice(0, 1000),
@@ -157,6 +161,10 @@ async function handleAgentById(req, kvH, id) {
       agent.skillIds = body.skillIds.map(String).slice(0, 12);
     }
     if (typeof body.autoLearn === "boolean") agent.autoLearn = body.autoLearn;
+    if (typeof body.autoResearch === "boolean") agent.autoResearch = body.autoResearch;
+    if (Array.isArray(body.researchTopics)) {
+      agent.researchTopics = body.researchTopics.map((t) => String(t).slice(0, 200)).filter(Boolean).slice(0, 10);
+    }
     if (typeof body.deepThink === "boolean") agent.deepThink = body.deepThink;
     if (["fast", "balanced", "deep"].includes(body.effort)) agent.effort = body.effort;
     for (const f of ["expertise", "style", "avoidTopics"]) {
@@ -509,6 +517,93 @@ async function runDeepResearch(env, kvH, agent, query, send) {
 
   send({ type: "research", stage: "done", id: rec.id });
   return { report, rec };
+}
+
+/* ---------------- autonomous research (cron) ---------------- */
+
+async function pickResearchTopic(kvH, agent) {
+  // 1. Rotate through the user's topic list
+  const topics = agent.researchTopics || [];
+  if (topics.length) {
+    const k = `research:${agent.id}:idx`;
+    const idx = Number((await kvH.get(k)) || 0);
+    await kvH.set(k, (idx + 1) % topics.length);
+    return topics[idx % topics.length];
+  }
+  // 2. Fall back to the most recent knowledge gap
+  const log = (await kvH.get(`learn:${agent.id}`)) || [];
+  const gaps = log.filter((e) => e.event === "gap").slice(-5);
+  if (gaps.length) {
+    const t = String(gaps[gaps.length - 1].detail || "").replace(/^فجوة معرفية:\s*/, "").slice(0, 200);
+    if (t.length > 3) return t;
+  }
+  return "";
+}
+
+async function autoResearchOne(env, kvH, agent) {
+  const topic = await pickResearchTopic(kvH, agent);
+  if (!topic) return { skipped: true };
+  const at = new Date().toISOString();
+  // Autonomous mode: search the web directly (the KB is covered in chat)
+  const wsTool = getBuiltinTool("web_search");
+  const out = await wsTool.run({ query: topic }, { fetch, agent, env });
+  const results = (out.results || []).slice(0, 3);
+  const fetchTool = getBuiltinTool("url_fetch");
+  const sources = [];
+  for (const r of results) {
+    try {
+      const page = await fetchTool.run({ url: r.url, maxChars: 2500 }, { fetch, agent, env });
+      const text = String(page.text || "").slice(0, 2500);
+      if (text.length > 200) sources.push({ title: r.title, text });
+    } catch { /* skip failed source */ }
+  }
+  if (!sources.length) return { skipped: true };
+  // Extract memorable facts
+  const material = sources.map((s, i) => `[مصدر ${i + 1} — ${s.title}]: ${s.text}`).join("\n");
+  const { result } = await runChatLLM(env, agent.model, [
+    { role: "system", content: `أنت باحث مستقل. استخرج من هذه المصادر أهم 3-5 حقائق جديدة ومفيدة تستحق الحفظ في الذاكرة الدائمة لوكيل ذكاء اصطناعي. أعد JSON فقط: {"facts":["..."]}` },
+    { role: "user", content: `الموضوع: ${topic}\n\n${material.slice(0, 6000)}` },
+  ], 600);
+  const facts = [];
+  try {
+    const m = String(result?.response || "").match(/\{[\s\S]*\}/);
+    if (m) facts.push(...(JSON.parse(m[0]).facts || []));
+  } catch { /* no facts */ }
+  const learned = (await kvH.get(`learned:${agent.id}`)) || [];
+  let added = 0;
+  for (const f of facts.slice(0, 5)) {
+    const txt = String(f).slice(0, 300);
+    if (txt.length > 15 && !learned.some((l) => l.text === txt)) {
+      learned.push({ text: txt, at, source: "auto-research" });
+      added++;
+    }
+  }
+  if (added) {
+    await kvH.set(`learned:${agent.id}`, learned.slice(-60));
+    const log = (await kvH.get(`learn:${agent.id}`)) || [];
+    log.push({
+      at, event: "auto-research",
+      detail: `بحث تلقائي: "${topic}" — ${sources.length} مصادر، ${added} حقائق جديدة في الذاكرة.`,
+    });
+    await kvH.set(`learn:${agent.id}`, log.slice(-200));
+    await bumpStat(kvH, "neurons", chatNeurons(agent.model, material.length, 600));
+  }
+  return { skipped: false, topic, sources: sources.length, added };
+}
+
+export async function autoResearchCycle(env) {
+  const kvH = kv(env);
+  const agents = await listAgents(kvH);
+  const researchers = agents.filter((a) => a.autoResearch && a.isActive).slice(0, 3);
+  const out = [];
+  for (const agent of researchers) {
+    try {
+      out.push({ agent: agent.id, ...(await autoResearchOne(env, kvH, agent)) });
+    } catch {
+      out.push({ agent: agent.id, error: true });
+    }
+  }
+  return out;
 }
 
 async function handleChat(req, env, kvH, waitCtx) {
@@ -970,7 +1065,7 @@ async function handleBrain(kvH, agentId) {
     link(A, id);
   }
   const log = (await kvH.get(`learn:${agent.id}`)) || [];
-  const evIcon = { memory: "🧠", lesson: "💡", gap: "❓", training: "📄", quality: "⭐", research: "🔬" };
+  const evIcon = { memory: "🧠", lesson: "💡", gap: "❓", training: "📄", quality: "⭐", research: "🔬", "auto-research": "🛰️" };
   for (const e of log.slice(-12)) {
     const id = `ev${i++}`;
     add(id, (e.detail || "").slice(0, 42), "event", evIcon[e.event] || "✨", e.detail);
@@ -1321,6 +1416,32 @@ export default {
         }
       }
 
+      // Live activity ticker: recent events across all agents + today's stats
+      if (path === "/api/activity" && request.method === "GET") {
+        const agents = await listAgents(kvH);
+        const icons = { memory: "🧠", lesson: "💡", gap: "❓", training: "📄", quality: "⭐", research: "🔬", "auto-research": "🛰️" };
+        const items = [];
+        for (const a of agents.slice(0, 15)) {
+          const log = (await kvH.get(`learn:${a.id}`)) || [];
+          for (const e of log.slice(-6)) {
+            items.push({
+              at: e.at, icon: icons[e.event] || "•",
+              agent: `${a.avatar || "🤖"} ${a.name}`,
+              text: String(e.detail || "").slice(0, 140),
+            });
+          }
+        }
+        const day = new Date().toISOString().slice(0, 10);
+        const msgs = (await kvH.get(`stats:${day}:messages`)) || 0;
+        const neurons = (await kvH.get(`stats:${day}:neurons`)) || 0;
+        items.push({
+          at: new Date().toISOString(), icon: "📊", agent: "النظام",
+          text: `نشاط اليوم: ${msgs} رسالة — ${Number(neurons).toLocaleString("ar")} خلية مستهلكة`,
+        });
+        items.sort((x, y) => new Date(y.at) - new Date(x.at));
+        return json({ items: items.slice(0, 25) });
+      }
+
       // Research history per agent
       if (path.match(/^\/api\/research\/[^/]+$/) && request.method === "GET") {
         const agentId = path.split("/")[3];
@@ -1434,5 +1555,10 @@ export default {
     } catch (e) {
       return json({ code: "upstream", message: "خطأ في الخادم", detail: errDetail(e) }, 502);
     }
+  },
+
+  // Cron trigger: autonomous research every 30 minutes
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(autoResearchCycle(env));
   },
 };
