@@ -158,7 +158,7 @@ test("agent CRUD round-trip", async () => {
   assert.equal(agent.name, "وكيل الاختبار");
 
   const listed = await (await api(env, "/api/agents")).json();
-  assert.equal(listed.agents.length, 1);
+  assert.equal(listed.agents.filter((a) => !a.isOctopus).length, 1);
 
   const patched = await api(env, `/api/agents/${agent.id}`, {
     method: "PATCH", headers: { "content-type": "application/json" },
@@ -169,7 +169,7 @@ test("agent CRUD round-trip", async () => {
   const del = await api(env, `/api/agents/${agent.id}`, { method: "DELETE" });
   assert.equal(del.status, 200);
   const listed2 = await (await api(env, "/api/agents")).json();
-  assert.equal(listed2.agents.length, 0);
+  assert.equal(listed2.agents.filter((a) => !a.isOctopus).length, 0);
 });
 
 test("quick customize generates a draft from one sentence", async () => {
@@ -283,7 +283,7 @@ test("POST /api/learn extracts memories and writes the timeline", async () => {
   assert.ok(data.events.length >= 2);
 
   const mem = await (await api(env, `/api/memories/${agent.id}`)).json();
-  assert.equal(mem.memories["العملة المفضلة"], "الدرهم المغربي");
+  assert.equal(mem.memories["العملة المفضلة"].value, "الدرهم المغربي");
 
   const log = await (await api(env, `/api/learning-log/${agent.id}`)).json();
   assert.ok(log.events.length >= 2);
@@ -595,7 +595,7 @@ test("backup import recreates agents", async () => {
   const r = await (await postJson(env, "/api/backup/import", { backup })).json();
   assert.equal(r.agents, n1);
   const list = await (await api(env, "/api/agents")).json();
-  assert.equal(list.agents.length, n1 * 2);
+  assert.equal(list.agents.filter((a) => !a.isOctopus).length, n1 * 2);
 });
 
 /* ---------- version history ---------- */
@@ -651,7 +651,7 @@ test("gaps endpoint returns knowledge gaps across agents", async () => {
   await kv.put(`learn:${agent.id}`, JSON.stringify([{ at: new Date().toISOString(), event: "gap", detail: "فجوة: أسعار الذهب" }]));
   const gaps = await (await api(env, "/api/gaps")).json();
   assert.ok(Array.isArray(gaps.gaps));
-  assert.ok(gaps.gaps.some((g) => g.agentId === agent.id));
+  assert.ok(gaps.gaps.some((g) => g.agents.some((a) => a.id === agent.id)));
 });
 
 /* ---------- deep research ---------- */
@@ -828,4 +828,169 @@ test("activity ticker aggregates events and stats", async () => {
       assert.ok(new Date(items[i - 1].at) >= new Date(items[i].at));
     }
   } finally { restore(); }
+});
+
+/* ---------- 🐙 Octopus v2 ---------- */
+
+import { octopusAgent, ensureOctopus, OCTOPUS_SYSTEM, MEMORY_CATEGORIES } from "../src/agents.js";
+import { learnFromConversation, memoryValue } from "../src/learn.js";
+
+test("octopusAgent has the operator persona and all arms", () => {
+  const o = octopusAgent();
+  assert.equal(o.isOctopus, true);
+  assert.equal(o.avatar, "🐙");
+  assert.equal(o.name, "أخطبوط");
+  assert.ok(o.systemPrompt.includes("أخطبوط"));
+  assert.ok(o.systemPrompt.length > 200);
+  for (const t of ["web_search", "reminder", "image_generate", "url_fetch", "calculator"]) {
+    assert.ok(o.tools.includes(t), `missing tool ${t}`);
+  }
+  assert.equal(o.autoLearn, true);
+  assert.equal(o.deepThink, true);
+});
+
+test("ensureOctopus creates exactly one octopus on empty store", async () => {
+  const kv = mockKV();
+  const first = await ensureOctopus(kv);
+  const octs1 = first.filter((a) => a.isOctopus);
+  assert.equal(octs1.length, 1);
+  const second = await ensureOctopus(kv);
+  assert.equal(second.filter((a) => a.isOctopus).length, 1);
+  assert.equal(second.length, first.length);
+});
+
+test("GET /api/agents auto-provisions the octopus", async () => {
+  const env = mockEnv(async () => ({ response: "{}" }));
+  const { agents } = await (await api(env, "/api/agents")).json();
+  assert.ok(agents.some((a) => a.isOctopus && a.avatar === "🐙"));
+  const { agents: again } = await (await api(env, "/api/agents")).json();
+  assert.equal(again.filter((a) => a.isOctopus).length, 1);
+});
+
+test("memoryValue handles legacy plain-string memories", () => {
+  assert.deepEqual(memoryValue("نص قديم"), { value: "نص قديم", category: "أخرى" });
+  assert.deepEqual(memoryValue({ value: "خالد", category: "شخصي" }), { value: "خالد", category: "شخصي" });
+  assert.deepEqual(memoryValue({ value: "x", category: "غير موجودة" }), { value: "x", category: "أخرى" });
+  assert.ok(MEMORY_CATEGORIES.includes("تفضيلات"));
+});
+
+test("learnFromConversation categorizes memories", async () => {
+  const env = mockEnv(async () => ({
+    response: '{"memories":[{"key":"الاسم","value":"خالد","category":"شخصي"},{"key":"المهنة","value":"مهندس","category":"عمل"}],"lessons":[],"gaps":[]}',
+  }));
+  const kv = mockKV();
+  const agent = { id: "ag_cat", name: "T" };
+  await learnFromConversation(env, kv, agent, [
+    { role: "user", content: "اسمي خالد وأنا مهندس برمجيات أعمل في شركة تقنية كبيرة في الدار البيضاء" },
+    { role: "assistant", content: "أهلاً خالد! سأتذكر اسمك ومهنتك." },
+  ]);
+  const mems = await kv.get("mem:ag_cat");
+  assert.equal(mems["الاسم"].category, "شخصي");
+  assert.equal(mems["المهنة"].category, "عمل");
+  assert.equal(memoryValue(mems["الاسم"]).value, "خالد");
+  const log = await kv.get("learn:ag_cat");
+  assert.ok(log.some((e) => e.event === "memory" && e.detail.includes("[شخصي]")));
+});
+
+test("brain memory nodes carry their category", async () => {
+  const env = mockEnv(async () => ({ response: "{}" }));
+  const { agent } = await (await postJson(env, "/api/agents", { name: "B" })).json();
+  const kv = env.STUDIO_KV;
+  await kv.put(`mem:${agent.id}`, JSON.stringify({
+    الهواية: { value: "القراءة", category: "تفضيلات", at: new Date().toISOString() },
+  }));
+  const { nodes } = await (await api(env, `/api/brain/${agent.id}`)).json();
+  const m = nodes.find((n) => n.kind === "memory");
+  assert.ok(m);
+  assert.equal(m.cat, "تفضيلات");
+});
+
+test("gaps are aggregated with counts, most frequent first", async () => {
+  const env = mockEnv(async () => ({ response: "{}" }));
+  const { agent } = await (await postJson(env, "/api/agents", { name: "G2" })).json();
+  const kv = env.STUDIO_KV;
+  const now = new Date().toISOString();
+  await kv.put(`learn:${agent.id}`, JSON.stringify([
+    { at: now, event: "gap", detail: "فجوة: أسعار الذهب" },
+    { at: now, event: "gap", detail: "فجوة: أسعار الذهب" },
+    { at: now, event: "gap", detail: "فجوة: الطقس" },
+  ]));
+  const { gaps } = await (await api(env, "/api/gaps")).json();
+  assert.equal(gaps[0].detail, "فجوة: أسعار الذهب");
+  assert.equal(gaps[0].count, 2);
+  assert.ok(gaps[0].agents.some((a) => a.id === agent.id));
+});
+
+test("mind summary generates, caches, and counts categories", async () => {
+  const env = mockEnv(async () => ({ response: "ملخص: المستخدم خالد، مهندس برمجيات." }));
+  const { agent } = await (await postJson(env, "/api/agents", { name: "MS" })).json();
+  const kv = env.STUDIO_KV;
+  await kv.put(`mem:${agent.id}`, JSON.stringify({
+    الاسم: { value: "خالد", category: "شخصي", at: new Date().toISOString() },
+    المهنة: { value: "مهندس", category: "عمل", at: new Date().toISOString() },
+  }));
+  const r1 = await (await api(env, `/api/mind/${agent.id}`)).json();
+  assert.ok(r1.summary.includes("خالد"));
+  assert.equal(r1.cached, false);
+  assert.equal(r1.counts["شخصي"], 1);
+  assert.equal(r1.counts["عمل"], 1);
+  assert.equal(r1.memories, 2);
+  const r2 = await (await api(env, `/api/mind/${agent.id}`)).json();
+  assert.equal(r2.cached, true);
+  assert.equal(r2.summary, r1.summary);
+});
+
+test("mind summary handles empty memory gracefully", async () => {
+  const env = mockEnv(async () => ({ response: "x" }));
+  const { agent } = await (await postJson(env, "/api/agents", { name: "MS2" })).json();
+  const r = await (await api(env, `/api/mind/${agent.id}`)).json();
+  assert.ok(r.summary.length > 10);
+  assert.equal(r.memories, 0);
+});
+
+test("comprehensive research trigger is detected", async () => {
+  const env = researchEnv();
+  const restore = stubFetch();
+  try {
+    const { agent } = await (await postJson(env, "/api/agents", { name: "RC" })).json();
+    const text = await (await postJson(env, "/api/chat", { agentId: agent.id, message: "بحث شامل عن الذهب" })).text();
+    assert.ok(text.includes('"type":"research"'));
+    assert.ok(text.includes('"depth":"comprehensive"'));
+    assert.ok(text.includes("ملخص تنفيذي"));
+  } finally { restore(); }
+});
+
+test("research dedupes sources by URL", async () => {
+  const env = mockEnv(async (model, input) => {
+    const sys = JSON.stringify(input.messages || []);
+    if (sys.includes("باحث محلل")) return { response: "## ملخص تنفيذي\nنص.\n## النقاط الرئيسية\n1. ن.\n## تحليل\nت.\n## المصادر\nو." };
+    if (sys.includes("استخرج أهم")) return { response: '{"lessons":[]}' };
+    if (sys.includes("ولّد 3 صيغ")) return { response: '{"queries":["الذهب معدن","أسعار الذهب"]}' };
+    return { response: '{"answer":true}' };
+  });
+  const real = globalThis.fetch;
+  let pageHits = 0;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes("duckduckgo")) {
+      return {
+        ok: true,
+        text: async () => `<html><body>
+          <a class="result__a" href="https://example.com/gold?a=1">ذهب 1</a>
+          <a class="result__a" href="https://example.com/gold?a=2">ذهب 2 (نفس الصفحة)</a>
+          <a class="result__a" href="https://example.com/silver">فضة</a>
+        </body></html>`,
+      };
+    }
+    pageHits++;
+    return { ok: true, text: async () => `<html><head><title>t</title></head><body><p>${"نص طويل كافٍ لتجاوز عتبة المئتي حرف المطلوبة لقبول المصدر في قائمة المصادر المعتمدة للبحث المعمق. ".repeat(4)}</p></body></html>` };
+  };
+  try {
+    const { agent } = await (await postJson(env, "/api/agents", { name: "RD" })).json();
+    await (await postJson(env, "/api/chat", { agentId: agent.id, message: "ابحث بعمق عن الذهب" })).text();
+    const { research } = await (await api(env, `/api/research/${agent.id}`)).json();
+    assert.equal(research.length, 1);
+    // 2 unique pages (gold + silver), the ?a=2 duplicate collapsed
+    assert.equal(research[0].webSources, 2);
+  } finally { globalThis.fetch = real; }
 });
