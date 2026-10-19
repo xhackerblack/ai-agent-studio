@@ -904,7 +904,7 @@ $("btn-train-open").onclick = () => {
 const KIND_COLORS = {
   agent: "#a78bfa", memory: "#8b5cf6", lesson: "#34d399", file: "#60a5fa",
   chunk: "#38bdf8", tool: "#fbbf24", skill: "#f472b6", event: "#f87171",
-  image: "#fb923c", eval: "#facc15",
+  image: "#fb923c", eval: "#facc15", niche: "#22d3ee",
 };
 /* 🐙 v2: memory nodes colored by their expert category */
 const CAT_COLORS = {
@@ -919,7 +919,7 @@ function nodeColor(n) {
 const KIND_AR = {
   agent: "الوكيل", memory: "ذاكرة دائمة", lesson: "درس مستخلص", file: "ملف تدريب",
   chunk: "مقطع معرفي", tool: "أداة", skill: "مهارة مدمجة", event: "حدث تعلّم",
-  image: "صورة مولدة", eval: "تقييم صورة",
+  image: "صورة مولدة", eval: "تقييم صورة", niche: "نيتش/أسلوب",
 };
 
 const Brain = {
@@ -1223,7 +1223,7 @@ async function loadBrain(soft = false) {
 
 function updateBrainStats(data) {
   const s = data.stats;
-  const names = { memory: "🧠 ذاكرة", lesson: "💡 دروس", file: "📄 ملفات", tool: "🔧 أدوات", skill: "🧩 مهارات", event: "✨ أحداث", image: "🖼️ صور", eval: "⭐ تقييمات" };
+  const names = { memory: "🧠 ذاكرة", lesson: "💡 دروس", file: "📄 ملفات", tool: "🔧 أدوات", skill: "🧩 مهارات", event: "✨ أحداث", image: "🖼️ صور", eval: "⭐ تقييمات", niche: "🧬 نيتش" };
   let html = `<span class="bstat live"><span class="dot"></span>مباشر</span><span class="bstat"><b>${s.total}</b> عقدة</span>`;
   for (const [k, label] of Object.entries(names)) {
     if (s.counts[k]) html += `<span class="bstat"><b>${s.counts[k]}</b> ${label}</span>`;
@@ -1323,60 +1323,172 @@ function renderGallery() {
   }
 }
 
+let nichePlan = null; // {niche,label,icon,subject,refined} from /api/niche/analyze
+
 function initImageStudio() {
   renderImgStyles();
   fillImageModels();
   renderGallery();
-  $("btn-generate").onclick = async () => {
-    const ta = $("img-prompt");
-    let prompt = ta.value.trim();
-    if (!prompt) return toast("اكتب وصف الصورة أولاً", true);
-    if (activeStyle >= 0) prompt += IMG_STYLES[activeStyle].suffix;
-    const st = $("img-status");
-    const resBox = $("img-result");
-    st.classList.remove("hidden");
-    st.className = "note";
-    st.textContent = "⏳ جارٍ الرسم… (قد يستغرق ١٠–٣٠ ثانية)";
-    $("btn-generate").disabled = true;
-    try {
-      const r = await api("/api/generate-image", {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ prompt, model: $("img-model").value, agentId: state.currentAgent }),
-      });
-      st.classList.add("hidden");
-      saveRecentImage(r.id, prompt, r.evaluation);
-      resBox.classList.remove("hidden");
-      resBox.innerHTML = `<div class="card img-result-card">
-        <img class="gen-img" id="img-latest" src="${r.url}" alt="صورة مولدة">
-        <div class="row" style="margin-top:10px">
-          <button class="btn primary" id="img-dl" style="flex:1">⬇️ تحميل</button>
-          <button class="btn" id="img-view" style="flex:1">🔍 عرض مكبّر</button>
-        </div></div>` + evalPanelHTML(r.evaluation);
-      $("img-view").onclick = () => openViewer(r.url);
-      $("img-latest").onclick = () => openViewer(r.url);
-      $("img-dl").onclick = async () => {
-        try {
-          const resp = await fetch(r.url);
-          const blob = await resp.blob();
-          const a = document.createElement("a");
-          a.href = URL.createObjectURL(blob);
-          a.download = "ai-image-" + r.id.slice(0, 8) + ".png";
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-          setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-          toast("تم تحميل الصورة ⬇️");
-        } catch { window.open(r.url, "_blank"); }
-      };
-      renderGallery();
-      toast(r.evaluation && r.evaluation.evaluated ? `تم توليد الصورة! 🎨 التقييم الذاتي: ${r.evaluation.overall}/5 ⭐` : "تم توليد الصورة! 🎨");
-    } catch (e) {
-      st.className = "note err";
-      st.textContent = "❌ " + errText(e);
-    } finally {
-      $("btn-generate").disabled = false;
-    }
-  };
+  $("btn-generate").onclick = analyzeNicheUI;
+}
+
+/** Step 1: understand the request — niche detection + prompt refinement. */
+async function analyzeNicheUI() {
+  const ta = $("img-prompt");
+  let prompt = ta.value.trim();
+  if (!prompt) return toast("اكتب وصف الصورة أولاً", true);
+  if (activeStyle >= 0) prompt += IMG_STYLES[activeStyle].suffix;
+  const st = $("img-status");
+  const resBox = $("img-result");
+  st.classList.remove("hidden");
+  st.className = "note";
+  st.textContent = "🧠 جارٍ فهم طلبك وتحليل النيتش…";
+  $("btn-generate").disabled = true;
+  try {
+    const r = await api("/api/niche/analyze", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: prompt }),
+    });
+    nichePlan = r;
+    st.classList.add("hidden");
+    resBox.classList.remove("hidden");
+    resBox.innerHTML = `
+    <div class="card" style="border:1px solid #22d3ee">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">
+        <span style="font-size:24px">${r.icon}</span>
+        <b>النيتش: ${escapeHtml(r.label)}</b>
+        <small class="muted">${escapeHtml(r.subject || "")}</small>
+      </div>
+      <p class="muted" style="font-size:13px;margin:4px 0">✨ البرومبت المُحسّن (عدّله كما تشاء قبل التوليد):</p>
+      <textarea id="img-refined" rows="3">${escapeHtml(r.refined)}</textarea>
+      ${r.check && !r.check.ok ? `<div class="note err" style="margin-top:6px">⚠️ كان البرومبت سيفتقد قيود الأسلوب — تم إصلاحه تلقائياً.</div>` : ""}
+      <div class="row" style="margin-top:10px">
+        <button class="btn primary" id="btn-niche-generate" style="flex:1">🎨 ولّد الآن</button>
+        <button class="btn" id="btn-niche-research" style="flex:1">🔍 بحث عن النيتش</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input id="img-style-name" placeholder="اسم الأسلوب (مثال: خريف دافئ)" style="flex:1;margin:0">
+        <label class="btn" style="flex:1;text-align:center;cursor:pointer;margin:0">🎨📤 صورة مرجعية<input type="file" id="img-ref-upload" accept="image/*" class="hidden"></label>
+      </div>
+      <div id="niche-research-out"></div>
+    </div>
+    <div id="img-gen-result"></div>`;
+    $("btn-niche-generate").onclick = generateNicheImage;
+    $("btn-niche-research").onclick = researchNicheUI;
+    $("img-ref-upload").onchange = styleFromImageUI;
+    toast(`${r.icon} النيتش: ${r.label} — راجع البرومبت ثم ولّد`);
+  } catch (e) {
+    st.className = "note err";
+    st.textContent = "❌ " + errText(e);
+  } finally {
+    $("btn-generate").disabled = false;
+  }
+}
+
+/** Step 2: generate with the niche-intelligent prompt. */
+async function generateNicheImage() {
+  if (!nichePlan) return toast("حلّل النيتش أولاً", true);
+  const refined = ($("img-refined") && $("img-refined").value.trim()) || nichePlan.refined;
+  const st = $("img-status");
+  const genBox = $("img-gen-result");
+  st.classList.remove("hidden");
+  st.className = "note";
+  st.textContent = "⏳ جارٍ الرسم… (قد يستغرق ١٠–٣٠ ثانية)";
+  try {
+    const r = await api("/api/generate-image", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        prompt: refined, model: $("img-model").value, agentId: state.currentAgent,
+        niche: nichePlan.niche, subject: nichePlan.subject, refined,
+      }),
+    });
+    st.classList.add("hidden");
+    saveRecentImage(r.id, refined, r.evaluation);
+    genBox.innerHTML = `<div class="card img-result-card">
+      <img class="gen-img" id="img-latest" src="${r.url}" alt="صورة مولدة">
+      <div style="display:flex;align-items:center;gap:8px;margin:8px 0">
+        <span style="font-size:18px">${(r.niche && r.niche.icon) || "🎨"}</span>
+        <small class="muted">${escapeHtml((r.niche && r.niche.label) || "")}${r.evaluation && r.evaluation.regenerated ? " — 🔁 أُعيد توليدها بعد رسوب البوابة الصارمة" : ""}</small>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn primary" id="img-dl" style="flex:1">⬇️ تحميل</button>
+        <button class="btn" id="img-view" style="flex:1">🔍 عرض مكبّر</button>
+      </div></div>` + evalPanelHTML(r.evaluation);
+    $("img-view").onclick = () => openViewer(r.url);
+    $("img-latest").onclick = () => openViewer(r.url);
+    $("img-dl").onclick = async () => {
+      try {
+        const resp = await fetch(r.url);
+        const blob = await resp.blob();
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "ai-image-" + r.id.slice(0, 8) + ".png";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+        toast("تم تحميل الصورة ⬇️");
+      } catch { window.open(r.url, "_blank"); }
+    };
+    renderGallery();
+    toast(r.evaluation && r.evaluation.evaluated ? `تم توليد الصورة! 🎨 التقييم الذاتي: ${r.evaluation.overall}/5 ⭐` : "تم توليد الصورة! 🎨");
+  } catch (e) {
+    st.className = "note err";
+    st.textContent = "❌ " + errText(e);
+  }
+}
+
+/** Optional: web research on the niche → style DNA lessons. */
+async function researchNicheUI() {
+  if (!nichePlan) return;
+  if (!state.currentAgent) return toast("اختر وكيلاً من المحادثة أولاً ليُحفظ البحث في ذاكرته", true);
+  const out = $("niche-research-out");
+  out.innerHTML = `<div class="note" style="margin-top:8px">🔍 جارٍ البحث في الويب عن أساليب هذا النيتش…</div>`;
+  try {
+    const r = await api("/api/niche/research", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId: state.currentAgent, niche: nichePlan.niche, subject: nichePlan.subject }),
+    });
+    const d = r.dna || {};
+    const li = (arr) => (arr || []).length ? `<ul style="margin:6px 0;padding-inline-start:18px;font-size:13px">${arr.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>` : "";
+    out.innerHTML = `<div class="card" style="margin-top:8px;border:1px solid #22d3ee">
+      <b>🧬 DNA أسلوب النيتش</b> <small class="muted">(${r.sources || 0} مصادر)</small>
+      ${d.lineNotes ? `<p style="font-size:13px;margin:6px 0"><b>الخطوط:</b> ${escapeHtml(d.lineNotes)}</p>` : ""}
+      ${d.compositionNotes ? `<p style="font-size:13px;margin:6px 0"><b>التكوين:</b> ${escapeHtml(d.compositionNotes)}</p>` : ""}
+      ${li(d.elements)}${li((d.avoid || []).map((x) => "تجنّب: " + x))}
+      ${d.lesson ? `<div class="note" style="margin-top:6px">💡 ${escapeHtml(d.lesson)}</div>` : ""}
+      <small class="muted">حُفظ ${r.lessonsSaved || 0} دروس في ذاكرة الوكيل — ستُستخدم في التوليد القادم.</small>
+    </div>`;
+    toast(`🔍 اكتمل بحث النيتش — حُفظ ${r.lessonsSaved || 0} دروس`);
+  } catch (e) {
+    out.innerHTML = `<div class="note err" style="margin-top:8px">❌ ${escapeHtml(errText(e))}</div>`;
+  }
+}
+
+/** Extract a reusable style skill from a user-uploaded reference image. */
+async function styleFromImageUI(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  if (!state.currentAgent) return toast("اختر وكيلاً من المحادثة أولاً", true);
+  const name = ($("img-style-name") && $("img-style-name").value.trim()) || "أسلوب مرجعي";
+  toast("🎨 جارٍ استخلاص الأسلوب من الصورة…");
+  try {
+    const dataUrl = await new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(fr.result);
+      fr.onerror = rej;
+      fr.readAsDataURL(file);
+    });
+    const b64 = String(dataUrl).split(",")[1] || "";
+    const r = await api("/api/niche/style-from-image", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId: state.currentAgent, name, imageB64: b64 }),
+    });
+    toast(`🎨 حُفظت مهارة الأسلوب «${r.skill.name}» ورُبطت بالوكيل`);
+  } catch (err) {
+    toast(errText(err), true);
+  }
+  e.target.value = "";
 }
 
 /* ---------- Skills library ---------- */
