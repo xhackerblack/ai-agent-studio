@@ -427,7 +427,7 @@ const RESEARCH_SYSTEM = `أنت باحث محلل محترف. أمامك موض�
 (اذكر: قاعدة المعرفة الداخلية / الويب — بعناوينها)
 كن دقيقاً وموضوعياً. إن تعارضت المصادر اذكر التعارض. لا تخترع معلومات.`;
 
-async function runDeepResearch(env, kvH, agent, query, send, depth = "deep") {
+async function runDeepResearch(env, kvH, agent, query, send, depth = "deep", existingId = null) {
   const startedAt = new Date().toISOString();
   const kbHits = [];
   const webSources = [];
@@ -455,6 +455,7 @@ async function runDeepResearch(env, kvH, agent, query, send, depth = "deep") {
   const needWeb = kbHits.length < 2;
   if (needWeb) {
     send({ type: "research", stage: "web", state: "start" });
+    const liveEngines = new Set();
     try {
       // Query fan-out: 3 search phrasings for broader coverage
       let queries = [query];
@@ -476,6 +477,7 @@ async function runDeepResearch(env, kvH, agent, query, send, depth = "deep") {
       for (const q of queries) {
         if (webSources.length >= maxSources) break;
         const out = await wsTool.run({ query: q }, { fetch, agent, env });
+        for (const e of (out.engines || [])) liveEngines.add(e);
         for (const r of (out.results || [])) {
           if (webSources.length >= maxSources) break;
           const urlKey = String(r.url || "").split("?")[0].toLowerCase();
@@ -493,6 +495,7 @@ async function runDeepResearch(env, kvH, agent, query, send, depth = "deep") {
     send({
       type: "research", stage: "web", state: "done",
       sources: webSources.map((s) => ({ title: s.title, url: s.url })),
+      engines: [...liveEngines],
     });
   } else {
     send({ type: "research", stage: "web", state: "skipped", reason: "kb-sufficient" });
@@ -523,11 +526,13 @@ async function runDeepResearch(env, kvH, agent, query, send, depth = "deep") {
     if (m) {
       const arr = JSON.parse(m[0]).lessons || [];
       const learned = (await kvH.get(`learned:${agent.id}`)) || [];
+      const srcUrls = webSources.map((s) => s.url).filter(Boolean).slice(0, 8);
       for (const t of arr.slice(0, 5)) {
         const txt = String(t).slice(0, 300);
         if (txt.length > 10) {
           lessons.push(txt);
-          learned.push({ text: txt, at: startedAt, source: "research" });
+          // Learn FROM the sources: each lesson keeps its source URLs
+          learned.push({ text: txt, at: startedAt, source: "research", urls: srcUrls, query: query.slice(0, 120) });
         }
       }
       await kvH.set(`learned:${agent.id}`, learned.slice(-50));
@@ -540,20 +545,40 @@ async function runDeepResearch(env, kvH, agent, query, send, depth = "deep") {
     }
     neurons += chatNeurons(agent.model, 1500, 500);
   } catch { /* learning must never break research */ }
-  send({ type: "research", stage: "learn", state: "done", lessons: lessons.length });
+  send({ type: "research", stage: "learn", state: "done", lessons: lessons.length, sources: webSources.length });
 
-  // Save the research record
-  const rec = {
-    id: "rs_" + Date.now().toString(36), query, at: startedAt,
-    kbHits: kbHits.length, webSources: webSources.length,
-    lessons: lessons.length, summary: report.slice(0, 600),
-  };
+  // Save the research record (or refresh an existing one)
   const list = (await kvH.get(`research:${agent.id}`)) || [];
-  list.unshift(rec);
+  let rec;
+  if (existingId) {
+    rec = list.find((r) => r.id === existingId);
+  }
+  if (rec) {
+    rec.updatedAt = new Date().toISOString();
+    rec.refreshCount = (rec.refreshCount || 0) + 1;
+    rec.kbHits = kbHits.length;
+    rec.webSources = webSources.length;
+    rec.lessons = lessons.length;
+    rec.summary = report.slice(0, 600);
+    rec.sources = webSources.map((s) => ({ title: s.title, url: s.url }));
+    rec.depth = depth;
+    // Move refreshed record to the top
+    list.splice(list.indexOf(rec), 1);
+    list.unshift(rec);
+  } else {
+    rec = {
+      id: "rs_" + Date.now().toString(36), query, at: startedAt,
+      kbHits: kbHits.length, webSources: webSources.length,
+      lessons: lessons.length, summary: report.slice(0, 600),
+      sources: webSources.map((s) => ({ title: s.title, url: s.url })),
+      depth, refreshCount: 0,
+    };
+    list.unshift(rec);
+  }
   await kvH.set(`research:${agent.id}`, list.slice(0, 20));
   await bumpStat(kvH, "neurons", neurons);
 
-  send({ type: "research", stage: "done", id: rec.id });
+  send({ type: "research", stage: "done", id: rec.id, refreshed: !!existingId });
   return { report, rec };
 }
 
@@ -1556,6 +1581,19 @@ export default {
         const agentId = path.split("/")[3];
         const list = (await kvH.get(`research:${agentId}`)) || [];
         return json({ research: list });
+      }
+
+      // Refresh a research: re-run the live pipeline, learn from new sources, update the record
+      if (path === "/api/research/refresh" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const agent = await getAgent(kvH, String(body.agentId || ""));
+        if (!agent) return json({ code: "not-found", message: "الوكيل غير موجود" }, 404);
+        const query = String(body.query || "").trim().slice(0, 500);
+        if (!query) return json({ code: "bad", message: "موضوع البحث مطلوب" }, 400);
+        const depth = body.depth === "comprehensive" ? "comprehensive" : "deep";
+        const noop = () => {};
+        const { report, rec } = await runDeepResearch(env, kvH, agent, query, noop, depth, body.refreshId || null);
+        return json({ report, rec });
       }
 
       // Training suggestions: knowledge gaps aggregated & prioritized by frequency
