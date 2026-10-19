@@ -29,9 +29,65 @@ export function defaultAgent(overrides = {}) {
     style: "",
     avoidTopics: "",
     isActive: true,
+    isOctopus: false,
     createdAt: new Date().toISOString(),
     ...overrides,
   };
+}
+
+/* ---------------- 🐙 Octopus v2: the one super-agent ---------------- */
+
+export const OCTOPUS_AVATAR = "🐙";
+
+/**
+ * Operator persona — proactive autonomous assistant in the spirit of
+ * Hermes / Muse / OpenClaw: acts first on reversible steps, uses tools
+ * without asking, reports with live status lines, structured output,
+ * direct Arabic, zero fluff.
+ */
+export const OCTOPUS_SYSTEM = `أنت «أخطبوط» 🐙 — مساعد ذكاء اصطناعي مستقل يعمل كمشغّل محترف، بروح Hermes وMuse وOpenClaw.
+
+قواعد التشغيل:
+1. نفّذ أولاً: أي إجراء قابل للعكس نفّذه مباشرة ثم أعلن ما فعلت — لا تستأذن عن كل خطوة.
+2. الأدوات قبل التخمين: استخدم أدواتك (بحث، حساب، جلب روابط، تذكيرات، صور) تلقائياً متى أفادت.
+3. أعلن الحالة لحظة بلحظة: «🔧 أبحث الآن…» «📊 أحلّل النتائج…» «💾 حفظت في الذاكرة».
+4. مخرجات منظمة: عناوين ونقاط وجداول عند اللزوم — مباشر، دقيق، بلا حشو ولا اعتذارات زائدة.
+5. عند الغموض الحقيقي فقط اسأل سؤالاً واحداً محدداً، واقترح خيارك المفضل معه.
+6. تعلّم باستمرار: احفظ الحقائق المهمة عن المستخدم في ذاكرتك مصنّفة، وسجّل الدروس.
+7. أنت ذراعاك الثمانية: بحث، ذاكرة، صور، تذكير، حساب، ويب، تدريب، تحليل — وظّفها بذكاء.
+
+تحدث بالعربية دائماً ما لم يُطلب غير ذلك. هويتك: أخطبوط 🐙 — ذكي، سريع، يعتمد عليه.`;
+
+/** Memory categories for the expert-level organized mind. */
+export const MEMORY_CATEGORIES = ["شخصي", "عمل", "تفضيلات", "مشاريع", "أخرى"];
+
+export function octopusAgent(overrides = {}) {
+  return defaultAgent({
+    name: "أخطبوط",
+    avatar: OCTOPUS_AVATAR,
+    description: "وكيلك الخارق 🐙 — ثمانية أذرع: بحث، ذاكرة، صور، تذكيرات، حساب، ويب، تدريب، تحليل.",
+    tone: "مباشر، منظم، استباقي",
+    systemPrompt: OCTOPUS_SYSTEM,
+    tools: ["calculator", "datetime", "currency", "url_fetch", "web_search", "reminder", "image_generate"],
+    autoLearn: true,
+    deepThink: true,
+    effort: "balanced",
+    expertise: "مساعد شخصي شامل: بحث وتحليل وتنظيم معلومات وتذكيرات",
+    isOctopus: true,
+    ...overrides,
+  });
+}
+
+/**
+ * Ensure exactly one octopus agent exists. Called on GET /api/agents.
+ * Existing user agents are never touched or deleted.
+ */
+export async function ensureOctopus(kv) {
+  const agents = await listAgents(kv);
+  if (agents.some((a) => a.isOctopus)) return agents;
+  const oct = octopusAgent();
+  await saveAgent(kv, oct);
+  return [oct, ...agents];
 }
 
 export async function listAgents(kv) {
@@ -41,7 +97,9 @@ export async function listAgents(kv) {
     const a = await kv.get(`agent:${id}`);
     if (a) agents.push(a);
   }
-  return agents.sort((x, y) => (y.createdAt || "").localeCompare(x.createdAt || ""));
+  // 🐙 v2: the octopus always leads
+  const rank = (a) => (a.isOctopus ? 1 : 0);
+  return agents.sort((x, y) => (rank(y) - rank(x)) || (y.createdAt || "").localeCompare(x.createdAt || ""));
 }
 
 export async function getAgent(kv, id) {
