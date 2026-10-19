@@ -84,8 +84,28 @@ export const BUILTIN_TOOLS = [
     async run(args, ctx) {
       const url = String(args.url || "").trim();
       if (!/^https?:\/\//i.test(url)) throw new Error("رابط غير صالح");
+      // Wikipedia: use the API extracts endpoint (article HTML is often
+      // blocked for cloud IPs, while the API works reliably)
+      const wm = url.match(/^https:\/\/([a-z-]{2,12})\.wikipedia\.org\/wiki\/([^?#]+)$/);
+      if (wm) {
+        try {
+          const api = `https://${wm[1]}.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext&exchars=5000&titles=${wm[2]}&format=json&origin=*`;
+          const r = await ctx.fetch(api, {
+            headers: { "user-agent": "AI-Agent-Studio/2.0" },
+            signal: AbortSignal.timeout(12000),
+          });
+          if (r.ok) {
+            const d = await r.json().catch(() => ({}));
+            const pages = d?.query?.pages || {};
+            const first = Object.values(pages)[0] || {};
+            const text = String(first.extract || "").replace(/\s+/g, " ").trim().slice(0, 6000);
+            if (text.length > 200) return { url, text, via: "wikipedia-api" };
+          }
+        } catch { /* fall through to HTML fetch */ }
+      }
       const res = await ctx.fetch(url, {
-        headers: { "user-agent": "AI-Agent-Studio/1.0" },
+        headers: { "user-agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36" },
+        signal: AbortSignal.timeout(15000),
       });
       if (!res.ok) throw new Error(`فشل الجلب: HTTP ${res.status}`);
       const html = await res.text();
@@ -260,8 +280,10 @@ export const BUILTIN_TOOLS = [
       const prompt = String(args.prompt || "").trim();
       if (!prompt) throw new Error("وصف الصورة (prompt) مطلوب");
       if (!ctx.generateImage) throw new Error("توليد الصور غير متاح في هذا السياق");
-      const { id, url } = await ctx.generateImage(prompt);
-      return { id, url, note: "تم توليد الصورة وحفظها — أخبر المستخدم أنها جاهزة بالأسفل" };
+      const r = await ctx.generateImage(prompt);
+      const ev = r.evaluation;
+      const score = ev && ev.evaluated ? ` — التقييم الذاتي: ${ev.overall}/5` : "";
+      return { id: r.id, url: r.url, evaluation: ev || null, note: `تم توليد الصورة وحفظها${score} — أخبر المستخدم أنها جاهزة بالأسفل` };
     },
   },
 ];
