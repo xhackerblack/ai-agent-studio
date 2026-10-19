@@ -122,19 +122,69 @@ export const BUILTIN_TOOLS = [
     name: "reminder",
     label: "تذكير/مهمة",
     icon: "⏰",
-    description: "يحفظ تذكيراً أو مهمة للوكيل. الوسائط: {text, when} مثال: {text: \"مراجعة الأسعار\", when: \"غداً صباحاً\"}",
+    description: "يحفظ تذكيراً أو مهمة للوكيل. الوسائط: {text, when, dueAt} — مثال: {text: \"مراجعة الأسعار\", when: \"غداً 9 صباحاً\", dueAt: \"2026-10-20T09:00:00\"} (dueAt بصيغة ISO اختياري لتنبيه الهاتف)",
     async run(args, ctx) {
       const text = String(args.text || "").trim();
       if (!text) throw new Error("نص التذكير مطلوب");
+      const dueAt = String(args.dueAt || "").trim();
+      let dueISO = "";
+      if (dueAt) {
+        const d = new Date(dueAt);
+        if (!isNaN(d.getTime())) dueISO = d.toISOString();
+      }
       const item = {
         id: "rm_" + Date.now().toString(36),
         text,
         when: String(args.when || ""),
+        dueAt: dueISO,
         createdAt: new Date().toISOString(),
         done: false,
       };
       await ctx.addReminder(ctx.agent.id, item);
       return { saved: true, reminder: item };
+    },
+  },
+  {
+    name: "web_search",
+    label: "بحث الويب",
+    icon: "🔍",
+    description: "يبحث في الويب عن معلومات حديثة (أسعار، أخبار، وقائع). الوسائط: {query} مثال: {query: \"سعر الذهب اليوم\"}",
+    async run(args, ctx) {
+      const q = String(args.query || "").trim().slice(0, 200);
+      if (!q) throw new Error("query مطلوب");
+      // Primary: DuckDuckGo HTML
+      try {
+        const url = "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(q);
+        const res = await ctx.fetch(url, {
+          headers: { "user-agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36" },
+        });
+        if (res.ok) {
+          const html = await res.text();
+          const results = [];
+          const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+          let m;
+          while ((m = re.exec(html)) && results.length < 5) {
+            const title = m[2].replace(/<[^>]+>/g, "").replace(/&[^;]+;/g, " ").trim().slice(0, 140);
+            let href = m[1];
+            const ud = href.match(/[?&]uddg=([^&]+)/);
+            if (ud) { try { href = decodeURIComponent(ud[1]); } catch { /* keep */ } }
+            if (title && /^https?:\/\//i.test(href)) results.push({ title, url: href });
+          }
+          if (results.length) return { query: q, source: "duckduckgo", results };
+        }
+      } catch { /* fall through to Wikipedia */ }
+      // Fallback: Wikipedia (reliable, no key)
+      const wurl = "https://ar.wikipedia.org/w/api.php?action=query&list=search&srsearch=" +
+        encodeURIComponent(q) + "&format=json&srlimit=5&origin=*";
+      const wres = await ctx.fetch(wurl, { headers: { "user-agent": "AI-Agent-Studio/1.0" } });
+      if (!wres.ok) throw new Error("تعذّر البحث في الويب حالياً — أجب من معرفتك");
+      const data = await wres.json().catch(() => ({}));
+      const results = (data?.query?.search || []).map((s) => ({
+        title: s.title,
+        url: "https://ar.wikipedia.org/wiki/" + encodeURIComponent(String(s.title).replace(/ /g, "_")),
+        snippet: String(s.snippet || "").replace(/<[^>]+>/g, "").slice(0, 220),
+      }));
+      return { query: q, source: "wikipedia", results };
     },
   },
   {
