@@ -1310,6 +1310,7 @@ function renderGallery() {
     img.loading = "lazy";
     img.alt = it.prompt || "صورة مولدة";
     img.title = it.prompt || "";
+    img.style.cssText = "width:100%;aspect-ratio:1;object-fit:cover;border-radius:12px;cursor:pointer;border:1px solid var(--line);display:block";
     img.onclick = () => openViewer(img.src);
     wrap.appendChild(img);
     if (it.score != null) {
