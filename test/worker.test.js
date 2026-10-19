@@ -682,7 +682,7 @@ function stubFetch() {
     }
     return {
       ok: true,
-      text: async () => "<html><head><title>الذهب - ويكيبيديا</title></head><body><p>الذهب عنصر كيميائي رمزه Au وهو معدن ثمين أصفر اللون يستخدم في الحلي والاستثمار منذ آلاف السنين في مختلف الحضارات الإنسانية.</p></body></html>",
+      text: async () => "<html><head><title>الذهب - ويكيبيديا</title></head><body><p>الذهب عنصر كيميائي رمزه Au وهو معدن ثمين أصفر اللون يستخدم في الحلي والاستثمار منذ آلاف السنين في مختلف الحضارات الإنسانية. يتميز الذهب بكثافته العالية وقابليته للطرق والسحب، ولا يتأثر بالهواء والرطوبة. تعد جنوب أفريقيا والصين وأستراليا من أكبر منتجي الذهب في العالم. تتأثر أسعار الذهب بعدة عوامل منها التضخم وأسعار الفائدة والتوترات الجيوسياسية وحركة الدولار الأمريكي.</p></body></html>",
     };
   };
   return () => { globalThis.fetch = real; };
@@ -745,4 +745,87 @@ test("normal chat does not trigger research", async () => {
   const { agent } = await (await postJson(env, "/api/agents", { name: "R4" })).json();
   const text = await (await postJson(env, "/api/chat", { agentId: agent.id, message: "مرحبا كيف حالك" })).text();
   assert.ok(!text.includes('"type":"research"'));
+});
+
+/* ---------- autonomous research ---------- */
+
+import { autoResearchCycle } from "../src/worker.js";
+
+function autoResearchEnv() {
+  return mockEnv(async (model, input) => {
+    const sys = JSON.stringify(input.messages || []);
+    if (sys.includes("باحث مستقل")) {
+      return { response: '{"facts":["حقيقة أولى عن الذهب","حقيقة ثانية عن الذهب"]}' };
+    }
+    return { response: "{}" };
+  });
+}
+
+test("POST/PATCH persist autoResearch and researchTopics", async () => {
+  const env = mockEnv(async () => ({ response: "{}" }));
+  const { agent } = await (await postJson(env, "/api/agents", {
+    name: "AR", autoResearch: true, researchTopics: ["أسعار الذهب", "الذكاء الاصطناعي"],
+  })).json();
+  assert.equal(agent.autoResearch, true);
+  assert.deepEqual(agent.researchTopics, ["أسعار الذهب", "الذكاء الاصطناعي"]);
+  const patched = await (await api(env, `/api/agents/${agent.id}`, {
+    method: "PATCH", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ autoResearch: false, researchTopics: ["x"] }),
+  })).json();
+  assert.equal(patched.agent.autoResearch, false);
+  assert.deepEqual(patched.agent.researchTopics, ["x"]);
+});
+
+test("autoResearchCycle researches topics and grows memory", async () => {
+  const env = autoResearchEnv();
+  const restore = stubFetch();
+  try {
+    const { agent } = await (await postJson(env, "/api/agents", {
+      name: "AR2", autoResearch: true, researchTopics: ["الذهب"],
+    })).json();
+    const out = await autoResearchCycle(env);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].skipped, false);
+    assert.equal(out[0].topic, "الذهب");
+    assert.ok(out[0].added >= 1);
+    // Memory grew: learned lessons + log event
+    const brain = await (await api(env, `/api/brain/${agent.id}`)).json();
+    const lessons = brain.nodes.filter((n) => n.kind === "lesson");
+    assert.ok(lessons.some((l) => l.label.includes("الذهب")));
+    const events = brain.nodes.filter((n) => n.kind === "event");
+    assert.ok(events.some((e) => e.icon === "🛰️"));
+    // Topic rotation advanced
+    const { agent: a2 } = await (await api(env, `/api/agents/${agent.id}`)).json();
+    assert.equal(a2.autoResearch, true);
+  } finally { restore(); }
+});
+
+test("autoResearchCycle skips agents without autoResearch", async () => {
+  const env = autoResearchEnv();
+  const restore = stubFetch();
+  try {
+    await postJson(env, "/api/agents", { name: "AR3" });
+    const out = await autoResearchCycle(env);
+    assert.equal(out.length, 0);
+  } finally { restore(); }
+});
+
+test("activity ticker aggregates events and stats", async () => {
+  const env = autoResearchEnv();
+  const restore = stubFetch();
+  try {
+    const { agent } = await (await postJson(env, "/api/agents", {
+      name: "AR4", autoResearch: true, researchTopics: ["الذهب"],
+    })).json();
+    await autoResearchCycle(env);
+    const { items } = await (await api(env, "/api/activity")).json();
+    assert.ok(Array.isArray(items));
+    assert.ok(items.length >= 2);
+    assert.ok(items.some((i) => i.icon === "🛰️"));
+    assert.ok(items.some((i) => i.icon === "📊"));
+    // Newest first
+    for (let i = 1; i < items.length; i++) {
+      assert.ok(new Date(items[i - 1].at) >= new Date(items[i].at));
+    }
+  } finally { restore(); }
 });
