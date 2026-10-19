@@ -120,6 +120,13 @@ async function handleAgents(req, kvH, url) {
       model: String(body.model || DEFAULT_CHAT_MODEL),
       systemPrompt: String(body.systemPrompt || defaultAgent().systemPrompt).slice(0, 4000),
       tools: Array.isArray(body.tools) ? body.tools.filter((t) => getBuiltinTool(t)).slice(0, 8) : ["calculator", "datetime"],
+      skillIds: Array.isArray(body.skillIds) ? body.skillIds.map(String).slice(0, 12) : [],
+      autoLearn: !!body.autoLearn,
+      deepThink: !!body.deepThink,
+      effort: ["fast", "balanced", "deep"].includes(body.effort) ? body.effort : "balanced",
+      expertise: String(body.expertise || "").slice(0, 1000),
+      style: String(body.style || "").slice(0, 1000),
+      avoidTopics: String(body.avoidTopics || "").slice(0, 1000),
     });
     await saveAgent(kvH, agent);
     await bumpStat(kvH, "agentsCreated");
@@ -134,6 +141,12 @@ async function handleAgentById(req, kvH, id) {
   if (req.method === "GET") return json({ agent });
   if (req.method === "PATCH") {
     const body = await req.json().catch(() => ({}));
+    // Version history: snapshot the pre-change state (cap 20)
+    try {
+      const hist = (await kvH.get(`agenthist:${id}`)) || [];
+      hist.unshift({ at: new Date().toISOString(), name: agent.name, snapshot: { ...agent } });
+      await kvH.set(`agenthist:${id}`, hist.slice(0, 20));
+    } catch { /* history must never break the update */ }
     for (const f of ["name", "avatar", "description", "tone", "language", "model", "systemPrompt"]) {
       if (typeof body[f] === "string") agent[f] = body[f].slice(0, 4000);
     }
@@ -144,6 +157,11 @@ async function handleAgentById(req, kvH, id) {
       agent.skillIds = body.skillIds.map(String).slice(0, 12);
     }
     if (typeof body.autoLearn === "boolean") agent.autoLearn = body.autoLearn;
+    if (typeof body.deepThink === "boolean") agent.deepThink = body.deepThink;
+    if (["fast", "balanced", "deep"].includes(body.effort)) agent.effort = body.effort;
+    for (const f of ["expertise", "style", "avoidTopics"]) {
+      if (typeof body[f] === "string") agent[f] = body[f].slice(0, 1000);
+    }
     if (typeof body.isActive === "boolean") agent.isActive = body.isActive;
     await saveAgent(kvH, agent);
     return json({ agent });
@@ -249,19 +267,20 @@ async function handleImage(env, id) {
 /* ---------------- chat (SSE) ---------------- */
 
 const DECIDE_SYSTEM = `أنت مخطط أدوات لوكيل ذكاء اصطناعي. أمامك رسالة المستخدم وقائمة الأدوات المتاحة.
-إن كانت الرسالة تحتاج أداة فعلاً (حساب، وقت، عملات، جلب رابط، تذكير، API خارجي، رسم/توليد صورة) أعد JSON فقط:
+إن كانت الرسالة تحتاج أدوات فعلاً (حساب، وقت، عملات، بحث ويب، جلب رابط، تذكير، API خارجي، رسم/توليد صورة) أعد JSON فقط:
 {"tool":"اسم_الأداة","args":{...}}
-وإلا أعد JSON فقط: {"answer":true}
+يمكنك طلب أداة واحدة في كل مرة — ستُسأل مجدداً إن كنت تحتاج أداة أخرى بعد رؤية النتيجة.
+إن لم تعد تحتاج أي أداة أعد JSON فقط: {"answer":true}
 لا تضف أي نص خارج JSON.`;
 
-async function decideTool(env, agent, enabledTools, userText) {
+async function decideTool(env, agent, enabledTools, userText, priorResults = "") {
   if (!enabledTools.length) return null;
   const toolDesc = enabledTools
     .map((t) => `- ${t.name}: ${t.description}`)
     .join("\n");
   const raw = await runChatLLM(env, agent.model, [
     { role: "system", content: DECIDE_SYSTEM + "\n\nالأدوات:\n" + toolDesc },
-    { role: "user", content: userText.slice(0, 1500) },
+    { role: "user", content: userText.slice(0, 1500) + (priorResults ? `\n\nنتائج الأدوات السابقة:\n${priorResults}` : "") },
   ], 300).then((r) => r.result?.response || "");
   const m = String(raw).match(/\{[\s\S]*\}/);
   if (!m) return null;
@@ -272,6 +291,56 @@ async function decideTool(env, agent, enabledTools, userText) {
     }
   } catch { /* fall through */ }
   return null;
+}
+
+/* ---------------- deep thinking ---------------- */
+
+const THINK_SYSTEM = `أنت المفكّر العميق لوكيل ذكاء اصطناعي. حلّل طلب المستخدم بعمق قبل أن يجيب الوكيل.
+اكتب تحليلك بالعربية بهذا الهيكل المختصر:
+1. فهم الطلب: ما الذي يريده المستخدم فعلاً (وليس حرفياً)؟
+2. النقاط الأساسية: أهم 2-4 نقاط يجب تغطيتها في الإجابة.
+3. الافتراضات: ما الذي تفترضه لعدم وضوحه؟ اذكرها صراحة.
+4. خطة الإجابة: خطوات مرقمة إن كان الطلب معقداً، وإلا سطر واحد.
+5. المخاطر: ما الذي قد يُساء فهمه في الإجابة؟
+كن مركزاً وعملياً — لا حشو.`;
+
+const CRITIQUE_SYSTEM = `أنت مراجع دقيق لوكيل ذكاء اصطناعي. أمامك سؤال المستخدم ومسودة إجابة الوكيل.
+راجع المسودة: هل أجابت فعلاً عن السؤال؟ هل فيها أخطاء أو ثغرات أو حشو أو نبرة غير مناسبة؟
+ثم أعد كتابة الإجابة النهائية محسّنة وكاملة. أعد الإجابة النهائية فقط — دون شرح مراجعتك.`;
+
+async function runThinking(env, modelId, userText, toolResultText, effort) {
+  const maxTokens = effort === "deep" ? 900 : 400;
+  const { result } = await runChatLLM(env, modelId, [
+    { role: "system", content: THINK_SYSTEM },
+    { role: "user", content: `طلب المستخدم:\n${userText.slice(0, 2000)}${toolResultText ? `\n\nنتائج الأدوات:\n${toolResultText.slice(0, 1500)}` : ""}` },
+  ], maxTokens);
+  const text = typeof result?.response === "string" ? result.response.trim() : "";
+  return { text, inChars: userText.length + toolResultText.length + 600, outChars: text.length };
+}
+
+async function runCritique(env, modelId, userText, draft) {
+  const { result } = await runChatLLM(env, modelId, [
+    { role: "system", content: CRITIQUE_SYSTEM },
+    { role: "user", content: `سؤال المستخدم:\n${userText.slice(0, 1500)}\n\nمسودة الإجابة:\n${draft.slice(0, 4000)}` },
+  ], 1500);
+  const text = typeof result?.response === "string" ? result.response.trim() : "";
+  return { text: text || draft, inChars: userText.length + draft.length + 400, outChars: text.length };
+}
+
+async function runQualityRating(env, modelId, userText, answer) {
+  try {
+    const { result } = await runChatLLM(env, modelId, [
+      { role: "system", content: `قيّم جودة هذه الإجابة من 1 إلى 5 (5 = ممتازة) مع ملاحظة قصيرة جداً. أعد JSON فقط: {"score":4,"note":"..."}` },
+      { role: "user", content: `السؤال: ${userText.slice(0, 800)}\n\nالإجابة: ${answer.slice(0, 2000)}` },
+    ], 150);
+    const m = String(result?.response || "").match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    const o = JSON.parse(m[0]);
+    const score = Math.min(5, Math.max(1, Number(o.score) || 3));
+    return { score, note: String(o.note || "").slice(0, 200) };
+  } catch {
+    return null;
+  }
 }
 
 function buildSystemPrompt(agent, memories, learned, ragContext, skills) {
@@ -292,6 +361,11 @@ function buildSystemPrompt(agent, memories, learned, ragContext, skills) {
     parts.push("مهارات مدمجة — طبّقها باحتراف كلما كان ذلك مفيداً:\n" +
       skills.map((s) => `### ${s.icon || "🧩"} ${s.name}\n${s.instructions}`).join("\n"));
   }
+  const profile = [];
+  if (agent.expertise) profile.push(`مجال الخبرة: ${agent.expertise}`);
+  if (agent.style) profile.push(`أسلوب الرد: ${agent.style}`);
+  if (agent.avoidTopics) profile.push(`تجنّب: ${agent.avoidTopics}`);
+  if (profile.length) parts.push("ملف شخصية الوكيل:\n" + profile.map((p) => `- ${p}`).join("\n"));
   parts.push("لغة الرد: " + (agent.language || "العربية") + ". النبرة: " + (agent.tone || "ودود ومختصر") + ".");
   return parts.join("\n\n");
 }
@@ -352,74 +426,112 @@ async function handleChat(req, env, kvH, waitCtx) {
           ragContext = "";
         }
 
-        // Phase 1: decide tool
+        // Phase 1: decide tools (chains: up to 3 rounds)
         const enabledTools = (agent.tools || []).map(getBuiltinTool).filter(Boolean);
         let toolResultText = "";
         const imageIds = [];
+        const MAX_TOOL_ROUNDS = 3;
         try {
-          const decision = await decideTool(env, agent, enabledTools, userText);
-          if (decision) {
+          const toolCtx = {
+            fetch, agent, env,
+            getCustomTool: async (id) => kvH.get(`tool:${id}`),
+            generateImage: (prompt, model) => generateImage(env, prompt, model),
+            addReminder: async (agentId, item) => {
+              const k = `reminders:${agentId}`;
+              const list = (await kvH.get(k)) || [];
+              list.unshift(item);
+              await kvH.set(k, list.slice(0, 100));
+            },
+          };
+          for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+            const decision = await decideTool(env, agent, enabledTools, userText, toolResultText);
+            if (!decision) break;
             const tool = getBuiltinTool(decision.name);
             send({ type: "tool", icon: tool.icon, label: tool.label });
             toolsUsed.push(tool.label);
-            const ctx = {
-              fetch, agent, env,
-              getCustomTool: async (id) => kvH.get(`tool:${id}`),
-              generateImage: (prompt, model) => generateImage(env, prompt, model),
-              addReminder: async (agentId, item) => {
-                const k = `reminders:${agentId}`;
-                const list = (await kvH.get(k)) || [];
-                list.unshift(item);
-                await kvH.set(k, list.slice(0, 100));
-              },
-            };
-            const out = await tool.run(decision.args, ctx);
+            const out = await tool.run(decision.args, toolCtx);
             if (decision.name === "image_generate" && out && out.id) imageIds.push(out.id);
-            toolResultText = `نتيجة الأداة (${tool.label}): ${JSON.stringify(out).slice(0, 2000)}`;
+            toolResultText += `\nنتيجة الأداة (${tool.label}): ${JSON.stringify(out).slice(0, 2000)}`;
             await bumpStat(kvH, "toolCalls");
             if (decision.name === "image_generate") await bumpStat(kvH, "images");
           }
+          toolResultText = toolResultText.trim();
         } catch (e) {
           toolResultText = `تعذّر استخدام الأداة: ${errDetail(e)} — أجب بدونها.`;
         }
 
-        // Phase 2: stream the final answer
+        // Phase 1.5: deep thinking (optional per agent)
+        const deepOn = !!agent.deepThink && agent.effort !== "fast";
+        const effort = agent.effort === "deep" ? "deep" : "balanced";
+        let thinkingText = "";
+        if (deepOn) {
+          send({ type: "thinking", state: "start", effort });
+          try {
+            const th = await runThinking(env, agent.model, userText, toolResultText, effort);
+            thinkingText = th.text;
+            if (thinkingText) send({ type: "thinking", state: "done", text: thinkingText });
+            await bumpStat(kvH, "neurons", chatNeurons(agent.model, th.inChars, th.outChars));
+          } catch (e) {
+            send({ type: "thinking", state: "error" });
+          }
+        }
+
+        // Phase 2: build the final answer
         const system = buildSystemPrompt(agent, memories, learned, ragContext, skills);
-        const history = (conv.messages || []).slice(-12).map((m) => ({
+        const history = (conv.messages || []).slice(-30).map((m) => ({
           role: m.role === "user" ? "user" : "assistant", content: m.content,
         }));
         const finalMessages = [
           { role: "system", content: system },
           ...history,
-          { role: "user", content: userText + (toolResultText ? `\n\n${toolResultText}` : "") },
+          { role: "user", content: userText + (toolResultText ? `\n\n${toolResultText}` : "") + (thinkingText ? `\n\nتحليلك العميق (اعتمد عليه):\n${thinkingText}` : "") },
         ];
-        const { result, modelId } = await runChatLLM(env, agent.model, finalMessages, 1500, true);
         let full = "";
-        if (result && typeof result.getReader === "function") {
-          const reader = result.getReader();
-          const decoder = new TextDecoder();
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            const text = decoder.decode(value, { stream: true });
-            for (const line of text.split("\n")) {
-              const t = line.trim();
-              if (!t.startsWith("data:")) continue;
-              const payload = t.slice(5).trim();
-              if (payload === "[DONE]") continue;
-              try {
-                const o = JSON.parse(payload);
-                const delta = o?.response || o?.choices?.[0]?.delta?.content || "";
-                if (delta) {
-                  full += delta;
-                  send({ type: "token", text: delta });
-                }
-              } catch { /* keep-alive */ }
-            }
+        let modelId = agent.model;
+        if (deepOn && effort === "deep") {
+          // Deep mode: draft (non-stream) -> self-critique -> stream the refined answer
+          send({ type: "thinking", state: "critique" });
+          const draftRes = await runChatLLM(env, agent.model, finalMessages, 1500, false);
+          modelId = draftRes.modelId || agent.model;
+          const draft = typeof draftRes.result?.response === "string" ? draftRes.result.response : "";
+          await bumpStat(kvH, "neurons", chatNeurons(modelId, JSON.stringify(finalMessages).length, draft.length));
+          const crit = await runCritique(env, agent.model, userText, draft || "تعذّرت الصياغة.");
+          full = crit.text;
+          await bumpStat(kvH, "neurons", chatNeurons(modelId, crit.inChars, crit.outChars));
+          // Stream the refined answer so the UX stays live
+          for (let i = 0; i < full.length; i += 48) {
+            send({ type: "token", text: full.slice(i, i + 48) });
           }
-        } else if (typeof result?.response === "string") {
-          full = result.response;
-          send({ type: "token", text: full });
+        } else {
+          const r = await runChatLLM(env, agent.model, finalMessages, 1500, true);
+          modelId = r.modelId || agent.model;
+          const result = r.result;
+          if (result && typeof result.getReader === "function") {
+            const reader = result.getReader();
+            const decoder = new TextDecoder();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              const text = decoder.decode(value, { stream: true });
+              for (const line of text.split("\n")) {
+                const t = line.trim();
+                if (!t.startsWith("data:")) continue;
+                const payload = t.slice(5).trim();
+                if (payload === "[DONE]") continue;
+                try {
+                  const o = JSON.parse(payload);
+                  const delta = o?.response || o?.choices?.[0]?.delta?.content || "";
+                  if (delta) {
+                    full += delta;
+                    send({ type: "token", text: delta });
+                  }
+                } catch { /* keep-alive */ }
+              }
+            }
+          } else if (typeof result?.response === "string") {
+            full = result.response;
+            send({ type: "token", text: full });
+          }
         }
 
         // Persist
@@ -435,21 +547,36 @@ async function handleChat(req, env, kvH, waitCtx) {
           await kvH.set(`convs:${agent.id}`, ids.slice(0, 50));
         }
         await bumpStat(kvH, "messages", 2);
+        await bumpStat(kvH, `agent:${agent.id}:messages`, 2);
         await bumpStat(kvH, "neurons", chatNeurons(modelId, system.length + userText.length, full.length));
 
         send({ type: "done", tools: toolsUsed, images: imageIds });
         controller.close();
 
-        // Self-learning autopilot: if enabled, learn from this conversation
-        // in the background after the response is delivered.
-        if (agent.autoLearn && waitCtx && typeof waitCtx.waitUntil === "function") {
+        // Background: self-learning autopilot + quality self-rating (never block the reply)
+        if (waitCtx && typeof waitCtx.waitUntil === "function") {
           waitCtx.waitUntil((async () => {
             try {
-              const r = await learnFromConversation(env, kvH, agent, conv.messages);
-              if (!r.skipped) {
-                await bumpStat(kvH, "neurons", chatNeurons(agent.model, 4000, 1200));
+              if (agent.autoLearn) {
+                const r = await learnFromConversation(env, kvH, agent, conv.messages);
+                if (!r.skipped) {
+                  await bumpStat(kvH, "neurons", chatNeurons(agent.model, 4000, 1200));
+                }
               }
-            } catch { /* silent: learning must never break chat */ }
+              if (agent.deepThink && full.trim().length > 20) {
+                const q = await runQualityRating(env, agent.model, userText, full);
+                if (q) {
+                  const log = (await kvH.get(`learn:${agent.id}`)) || [];
+                  log.push({
+                    at: new Date().toISOString(), event: "quality",
+                    score: q.score,
+                    detail: `تقييم ذاتي للجودة: ${q.score}/5 — ${q.note}`,
+                  });
+                  await kvH.set(`learn:${agent.id}`, log.slice(-200));
+                  await bumpStat(kvH, "neurons", chatNeurons(agent.model, 1200, 150));
+                }
+              }
+            } catch { /* silent: background work must never break chat */ }
           })());
         }
       } catch (e) {
@@ -690,7 +817,7 @@ async function handleBrain(kvH, agentId) {
     link(A, id);
   }
   const log = (await kvH.get(`learn:${agent.id}`)) || [];
-  const evIcon = { memory: "🧠", lesson: "💡", gap: "❓", training: "📄" };
+  const evIcon = { memory: "🧠", lesson: "💡", gap: "❓", training: "📄", quality: "⭐" };
   for (const e of log.slice(-12)) {
     const id = `ev${i++}`;
     add(id, (e.detail || "").slice(0, 42), "event", evIcon[e.event] || "✨", e.detail);
@@ -757,6 +884,24 @@ async function handleDashboard(kvH) {
     kvH.get(`stats:${day}:agentsCreated`),
     kvH.get(`stats:${day}:images`),
   ]);
+  // Per-agent activity today + quality averages
+  const perAgent = [];
+  for (const a of agents.slice(0, 20)) {
+    const [am, log] = await Promise.all([
+      kvH.get(`stats:${day}:agent:${a.id}:messages`),
+      kvH.get(`learn:${a.id}`),
+    ]);
+    let qSum = 0, qN = 0;
+    for (const e of (log || [])) {
+      if (e.event === "quality" && typeof e.score === "number") { qSum += e.score; qN++; }
+    }
+    perAgent.push({
+      id: a.id, name: a.name, avatar: a.avatar,
+      messages: am || 0,
+      quality: qN ? Math.round((qSum / qN) * 10) / 10 : null,
+    });
+  }
+  perAgent.sort((x, y) => y.messages - x.messages);
   // Last 7 days activity
   const series = [];
   for (let i = 6; i >= 0; i--) {
@@ -773,8 +918,144 @@ async function handleDashboard(kvH) {
       images: images || 0,
       quotaLeft: Math.max(0, FREE_NEURONS_PER_DAY - (neurons || 0)),
     },
+    perAgent,
     series,
   });
+}
+
+/* ---------------- backup / export / import ---------------- */
+
+async function exportAgent(kvH, agentId) {
+  const agent = await getAgent(kvH, String(agentId || ""));
+  if (!agent) return null;
+  const [memories, learned, files, log, reminders] = await Promise.all([
+    kvH.get(`mem:${agent.id}`),
+    kvH.get(`learned:${agent.id}`),
+    kvH.get(`know:${agent.id}:files`),
+    kvH.get(`learn:${agent.id}`),
+    kvH.get(`reminders:${agent.id}`),
+  ]);
+  // Knowledge as plain texts (re-embedded on import)
+  const knowTexts = [];
+  for (const f of (files || [])) {
+    const rec = await kvH.get(`know:${agent.id}:${f.id}`);
+    if (rec && Array.isArray(rec.chunks)) {
+      knowTexts.push({ filename: f.filename, texts: rec.chunks.map((c) => c.text).filter(Boolean) });
+    }
+  }
+  const skillObjs = await getSkillsForAgent(kvH, agent);
+  return {
+    app: "ai-agent-studio-agent",
+    version: 1,
+    at: new Date().toISOString(),
+    agent, memories: memories || {}, learned: learned || [],
+    knowTexts, log: (log || []).slice(-100), reminders: reminders || [],
+    skills: skillObjs,
+  };
+}
+
+async function reembedTexts(env, texts) {
+  const embedded = [];
+  for (let i = 0; i < texts.length; i += 10) {
+    const batch = texts.slice(i, i + 10);
+    const r = await env.AI.run(EMBEDDING_MODEL, { text: batch });
+    const vecs = r?.data || [];
+    batch.forEach((t, j) => { if (vecs[j]) embedded.push({ text: t, embedding: vecs[j] }); });
+  }
+  return embedded;
+}
+
+async function importAgent(env, kvH, bundle) {
+  if (!bundle || bundle.app !== "ai-agent-studio-agent" || !bundle.agent) {
+    throw new Error("not an agent bundle");
+  }
+  const src = bundle.agent;
+  const agent = defaultAgent({
+    name: String(src.name || "وكيل مستورد").slice(0, 60) + " (مستورد)",
+    avatar: src.avatar || "🤖",
+    description: src.description || "",
+    tone: src.tone || "ودود ومختصر",
+    language: src.language || "العربية",
+    model: src.model || DEFAULT_CHAT_MODEL,
+    systemPrompt: src.systemPrompt || "",
+    tools: Array.isArray(src.tools) ? src.tools.filter((t) => getBuiltinTool(t)) : ["calculator", "datetime"],
+    deepThink: !!src.deepThink,
+    effort: ["fast", "balanced", "deep"].includes(src.effort) ? src.effort : "balanced",
+    expertise: src.expertise || "", style: src.style || "", avoidTopics: src.avoidTopics || "",
+    autoLearn: !!src.autoLearn,
+  });
+  await saveAgent(kvH, agent);
+  if (bundle.memories) await kvH.set(`mem:${agent.id}`, bundle.memories);
+  if (Array.isArray(bundle.learned)) await kvH.set(`learned:${agent.id}`, bundle.learned.slice(-50));
+  if (Array.isArray(bundle.log)) await kvH.set(`learn:${agent.id}`, bundle.log.slice(-200));
+  if (Array.isArray(bundle.reminders)) await kvH.set(`reminders:${agent.id}`, bundle.reminders.slice(0, 100));
+  // Restore skills into the library and enable them
+  if (Array.isArray(bundle.skills)) {
+    for (const s of bundle.skills) {
+      const skill = {
+        id: "sk_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+        name: String(s.name || "مهارة").slice(0, 60),
+        icon: s.icon || "🧩",
+        instructions: String(s.instructions || "").slice(0, 4000),
+        createdAt: new Date().toISOString(),
+      };
+      await kvH.set(`skill:${skill.id}`, skill);
+      const ids = (await kvH.get("skills:index")) || [];
+      ids.unshift(skill.id);
+      await kvH.set("skills:index", ids.slice(0, 100));
+      agent.skillIds.push(skill.id);
+    }
+    await saveAgent(kvH, agent);
+  }
+  // Re-embed knowledge texts
+  if (Array.isArray(bundle.knowTexts)) {
+    const files = [];
+    for (const kf of bundle.knowTexts.slice(0, 20)) {
+      const texts = (kf.texts || []).slice(0, 400);
+      if (!texts.length) continue;
+      const embedded = await reembedTexts(env, texts);
+      const fileId = "kf_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 4);
+      await kvH.set(`know:${agent.id}:${fileId}`, { chunks: embedded });
+      files.push({
+        id: fileId, filename: String(kf.filename || "مستورد").slice(0, 120),
+        chunks: embedded.length, uploadedAt: new Date().toISOString(),
+        note: "مستورد من نسخة احتياطية (أُعيد تضمينه)",
+      });
+    }
+    if (files.length) await kvH.set(`know:${agent.id}:files`, files);
+  }
+  return agent;
+}
+
+async function handleBackup(kvH) {
+  const agents = await listAgents(kvH);
+  const out = {
+    app: "ai-agent-studio-backup", version: 1,
+    at: new Date().toISOString(), agents: [],
+  };
+  for (const a of agents) {
+    out.agents.push(await exportAgent(kvH, a.id));
+  }
+  out.skills = await listSkills(kvH);
+  const ids = (await kvH.get("tools:index")) || [];
+  out.customTools = [];
+  for (const id of ids) {
+    const t = await kvH.get(`tool:${id}`);
+    if (t) out.customTools.push(t);
+  }
+  return json(out);
+}
+
+async function importBackup(env, kvH, backup) {
+  if (!backup || backup.app !== "ai-agent-studio-backup" || !Array.isArray(backup.agents)) {
+    throw new Error("not a backup file");
+  }
+  let count = 0;
+  for (const bundle of backup.agents.slice(0, 50)) {
+    await importAgent(env, kvH, bundle);
+    count++;
+  }
+  return count;
 }
 
 /* ---------------- router ---------------- */
@@ -820,7 +1101,7 @@ export default {
         }
       }
       let m = path.match(/^\/api\/agents\/([^/]+)$/);
-      if (m) return handleAgentById(request, kvH, m[1]);
+      if (m && m[1] !== "import") return handleAgentById(request, kvH, m[1]);
 
       if (path === "/api/conversations") return handleConversations(request, kvH, url);
       if (path === "/api/conversations/detail" && request.method === "GET") {
@@ -837,6 +1118,91 @@ export default {
           await kvH.set(`convs:${conv.agentId}`, ids);
         }
         return json({ ok: true });
+      }
+
+      // Agent version history + rollback
+      m = path.match(/^\/api\/agents\/([^/]+)\/history$/);
+      if (m && request.method === "GET") {
+        const hist = (await kvH.get(`agenthist:${m[1]}`)) || [];
+        return json({ history: hist.map((h, i) => ({ index: i, at: h.at, name: h.name })) });
+      }
+      m = path.match(/^\/api\/agents\/([^/]+)\/rollback$/);
+      if (m && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const hist = (await kvH.get(`agenthist:${m[1]}`)) || [];
+        const entry = hist[Number(body.index)];
+        if (!entry || !entry.snapshot) {
+          return json({ code: "bad", message: "نسخة غير موجودة" }, 400);
+        }
+        const restored = { ...entry.snapshot, id: m[1], updatedAt: new Date().toISOString() };
+        await saveAgent(kvH, restored);
+        return json({ agent: restored });
+      }
+
+      // Per-agent export / import (brain package)
+      m = path.match(/^\/api\/agents\/([^/]+)\/export$/);
+      if (m && request.method === "GET") {
+        const bundle = await exportAgent(kvH, m[1]);
+        if (!bundle) return json({ code: "not-found", message: "الوكيل غير موجود" }, 404);
+        return json(bundle);
+      }
+      if (path === "/api/agents/import" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        try {
+          const agent = await importAgent(env, kvH, body.bundle);
+          return json({ agent }, 201);
+        } catch (e) {
+          return json({ code: "bad", message: "ملف غير صالح", detail: errDetail(e) }, 400);
+        }
+      }
+
+      // Full backup: everything
+      if (path === "/api/backup" && request.method === "GET") return handleBackup(kvH);
+      if (path === "/api/backup/import" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        try {
+          const count = await importBackup(env, kvH, body.backup);
+          return json({ ok: true, agents: count }, 201);
+        } catch (e) {
+          return json({ code: "bad", message: "ملف النسخة غير صالح", detail: errDetail(e) }, 400);
+        }
+      }
+
+      // Training suggestions: recent knowledge gaps across agents
+      if (path === "/api/gaps" && request.method === "GET") {
+        const agents = await listAgents(kvH);
+        const gaps = [];
+        for (const a of agents.slice(0, 20)) {
+          const log = (await kvH.get(`learn:${a.id}`)) || [];
+          for (const e of log) {
+            if (e.event === "gap") {
+              gaps.push({ agentId: a.id, agentName: a.name, avatar: a.avatar, at: e.at, detail: e.detail });
+            }
+          }
+        }
+        gaps.sort((x, y) => new Date(y.at) - new Date(x.at));
+        return json({ gaps: gaps.slice(0, 10) });
+      }
+
+      // Link preview (title only)
+      if (path === "/api/preview" && request.method === "GET") {
+        const u = String(url.searchParams.get("url") || "").trim();
+        if (!/^https?:\/\//i.test(u) || u.length > 2000) {
+          return json({ code: "bad", message: "رابط غير صالح" }, 400);
+        }
+        try {
+          const res = await fetch(u, {
+            headers: { "user-agent": "AI-Agent-Studio/1.0" },
+            signal: AbortSignal.timeout(8000),
+          });
+          if (!res.ok) throw new Error("fetch failed");
+          const html = await res.text();
+          const tm = html.match(/<title[^>]*>([\s\S]{1,300})<\/title>/i);
+          const title = tm ? tm[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim().slice(0, 160) : "";
+          return json({ url: u, title });
+        } catch {
+          return json({ url: u, title: "" });
+        }
       }
 
       if (path === "/api/chat" && request.method === "POST") return handleChat(request, env, kvH, ctx);
