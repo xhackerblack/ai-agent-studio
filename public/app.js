@@ -7,7 +7,6 @@ const state = {
   agents: [],
   currentAgent: null,
   currentConv: null,
-  password: localStorage.getItem("aas_pw") || "",
   sheetOnClose: null,
 };
 
@@ -17,14 +16,16 @@ function escapeHtml(s) {
 }
 
 function headers(extra = {}) {
-  const h = { ...extra };
-  if (state.password) h["x-app-password"] = state.password;
-  return h;
+  return { ...extra }; // auth travels in the HttpOnly session cookie
 }
 
+let loginShown = false;
 async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers: headers(opts.headers || {}) });
-  if (res.status === 401) throw Object.assign(new Error("unauthorized"), { code: "unauthorized" });
+  if (res.status === 401) {
+    showLogin(); // session expired — show the login screen once
+    throw Object.assign(new Error("unauthorized"), { code: "unauthorized" });
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const e = new Error(data.code || res.status);
@@ -35,9 +36,11 @@ async function api(path, opts = {}) {
 }
 
 const ERR_AR = {
-  quota: "نفدت الحصة اليومية المجانية (١٠٬٠٠٠ خلية). تُصفَّر عند ٠٠:٠٠ UTC.",
+  quota: "وصلت الحصة اليومية التقديرية — تُصفَّر عند ٠٠:٠٠ UTC.",
   upstream: "تعذّرت الخدمة. حاوِل مجدداً.",
-  unauthorized: "كلمة المرور غير صحيحة — حدّثها في الإعدادات.",
+  unauthorized: "انتهت الجلسة — سجّل الدخول مجدداً.",
+  "no-password": "لم يُعرَّف APP_PASSWORD على الخادم بعد.",
+  "rate-limited": "محاولات كثيرة فاشلة — انتظر 15 دقيقة.",
   network: "تعذّر الاتصال بالخادم.",
 };
 function errText(e) {
@@ -111,6 +114,8 @@ function showView(name) {
   document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
   const view = $("view-" + name);
   view.classList.add("active");
+  $("appbar-title").textContent = view.dataset.title || "";
+  if (name === "settings") loadQuotaSettings(); // refresh the quota meter on entry
   $("appbar-title").textContent = view.dataset.title || "";
   document.querySelectorAll(".bottomnav button").forEach((b) =>
     b.classList.toggle("active", b.dataset.view === name));
@@ -2049,14 +2054,147 @@ async function loadSettings() {
   } catch (e) { toast(errText(e), true); }
 }
 $("mem-agent").onchange = loadSettings;
-$("btn-save-pw").onclick = () => {
-  state.password = $("set-password").value;
-  if (state.password) localStorage.setItem("aas_pw", state.password);
-  else localStorage.removeItem("aas_pw");
-  toast(state.password ? "حُفظت كلمة المرور على هذا الجهاز ✅" : "أُزيلت كلمة المرور");
+/* ---------- Login gate (session cookie; nothing stored in localStorage) ---------- */
+
+function showLogin() {
+  if (loginShown) return;
+  loginShown = true;
+  $("login-screen").classList.remove("hidden");
+  $("login-err").classList.add("hidden");
+  setTimeout(() => { try { $("login-password").focus(); } catch {} }, 100);
+}
+function hideLogin() {
+  loginShown = false;
+  $("login-screen").classList.add("hidden");
+  const pw = $("login-password");
+  if (pw) pw.value = "";
+}
+function showSetupNeeded() {
+  hideLogin();
+  const s = $("login-setup");
+  s.classList.remove("hidden");
+  s.innerHTML = `⚠️ لم يُعرَّف <b>APP_PASSWORD</b> على الخادم بعد.<br>
+    من الهاتف: <b>dash.cloudflare.com</b> ← Workers &amp; Pages ← <b>ai-agent-studio</b> ←
+    Settings ← Variables and Secrets ← <b>Add secret</b> ← الاسم <b dir="ltr">APP_PASSWORD</b> ←
+    أدخل كلمة مرور قوية ← Save ← ثم أعد النشر (Deployments ← Retry deployment).`;
+  $("login-screen").classList.remove("hidden");
+  loginShown = true;
+}
+async function doLogin() {
+  const pw = $("login-password").value;
+  const err = $("login-err");
+  err.classList.add("hidden");
+  if (!pw) { err.textContent = "أدخل كلمة المرور"; err.classList.remove("hidden"); return; }
+  $("btn-login").disabled = true;
+  try {
+    const r = await fetch("/api/login", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: pw }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.status === 503) { showSetupNeeded(); return; }
+    if (!r.ok) throw Object.assign(new Error(d.code || r.status), { code: d.code, message: d.message });
+    hideLogin();
+    toast("مرحباً بك 🐙");
+    await startApp();
+  } catch (e) {
+    err.textContent = errText(e);
+    err.classList.remove("hidden");
+  } finally {
+    $("btn-login").disabled = false;
+  }
+}
+$("btn-login").onclick = doLogin;
+$("login-password").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+
+/* ---------- Security & quota settings ---------- */
+
+async function loadQuotaSettings() {
+  const box = $("usage-box");
+  try {
+    const [u, s] = await Promise.all([api("/api/usage"), api("/api/settings")]);
+    const pct = Math.min(100, u.pct || 0);
+    const color = pct >= 100 ? "#ef4444" : pct >= 70 ? "#f59e0b" : "#22c55e";
+    box.innerHTML = `
+      <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">
+        <span>الخلايا العصبية اليوم (تقديري*)</span><b>${u.used} / ${u.cap}</b>
+      </div>
+      <div style="height:10px;background:#1f2937;border-radius:6px;overflow:hidden">
+        <div style="height:100%;width:${pct}%;background:${color};transition:width .4s"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;margin:4px 0 8px">
+        <span class="muted">*الرقم تقديري — ${pct}%</span>
+        ${u.bgStopped ? `<span style="color:#f59e0b">⏸️ المهام الخلفية متوقفة (≥70%)</span>` : ""}
+      </div>
+      <div style="font-size:13px" class="${u.kvAlert ? "" : "muted"}">
+        ${u.kvAlert ? "⚠️" : "✅"} كتابات KV اليوم: ${u.kvWrites} / ${u.kvWriteLimit}
+      </div>`;
+    $("set-cap").value = s.usageCap;
+    $("set-research-on").checked = !!s.researchEnabled;
+    $("set-research-every").value = String(s.researchEveryH);
+  } catch (e) {
+    box.innerHTML = `<div class="note err">تعذّر تحميل الحصة: ${escapeHtml(errText(e))}</div>`;
+  }
+}
+$("btn-save-cap").onclick = async () => {
+  try {
+    await api("/api/settings", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ usageCap: Number($("set-cap").value) || 8000 }),
+    });
+    toast("حُفظ السقف اليومي ✅");
+    loadQuotaSettings();
+  } catch (e) { toast(errText(e), true); }
+};
+$("set-research-on").onchange = async (e) => {
+  try {
+    await api("/api/settings", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ researchEnabled: e.target.checked }),
+    });
+    toast(e.target.checked ? "الباحث المستقل مفعّل 🔍" : "الباحث المستقل متوقف ⏸️");
+  } catch (err) { toast(errText(err), true); loadQuotaSettings(); }
+};
+$("set-research-every").onchange = async (e) => {
+  try {
+    await api("/api/settings", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ researchEveryH: Number(e.target.value) }),
+    });
+    toast("حُفظت فترة الباحث ✅");
+  } catch (err) { toast(errText(err), true); loadQuotaSettings(); }
+};
+$("btn-logout").onclick = async () => {
+  try { await fetch("/api/logout", { method: "POST" }); } catch {}
+  location.reload();
 };
 
 /* ---------- Init ---------- */
+let appStarted = false;
+async function startApp() {
+  if (appStarted) return;
+  appStarted = true;
+  initImageStudio();
+  initNotifications();
+  await loadAgents(); // backend auto-provisions the 🐙 octopus on first call
+  // Default chat agent: the octopus first, then saved choice, then first agent
+  const octo = state.agents.find((a) => a.isOctopus);
+  if (octo) setChatAgent(octo.id);
+  else if (state.currentAgent) setChatAgent(state.currentAgent);
+  else if (state.agents.length) setChatAgent(state.agents[0].id);
+  showView("dashboard");
+  loadQuotaSettings();
+  // First-launch welcome: meet your octopus 🐙
+  try {
+    if (!localStorage.getItem("octo_welcomed")) {
+      $("welcome").classList.remove("hidden");
+      $("btn-welcome").onclick = () => {
+        $("welcome").classList.add("hidden");
+        try { localStorage.setItem("octo_welcomed", "1"); } catch { /* ignore */ }
+      };
+    }
+  } catch { /* ignore */ }
+}
 (async function init() {
   renderSuggestions();
   initSkillsUI();
@@ -2079,25 +2217,11 @@ $("btn-save-pw").onclick = () => {
   }
   try {
     state.config = await api("/api/config");
-    initImageStudio();
-    initNotifications();
-    await loadAgents(); // backend auto-provisions the 🐙 octopus on first call
-    // Default chat agent: the octopus first, then saved choice, then first agent
-    const octo = state.agents.find((a) => a.isOctopus);
-    if (octo) setChatAgent(octo.id);
-    else if (state.currentAgent) setChatAgent(state.currentAgent);
-    else if (state.agents.length) setChatAgent(state.agents[0].id);
-    showView("dashboard");
-    // First-launch welcome: meet your octopus 🐙
-    try {
-      if (!localStorage.getItem("octo_welcomed")) {
-        $("welcome").classList.remove("hidden");
-        $("btn-welcome").onclick = () => {
-          $("welcome").classList.add("hidden");
-          try { localStorage.setItem("octo_welcomed", "1"); } catch { /* ignore */ }
-        };
-      }
-    } catch { /* ignore */ }
+    if (state.config.auth && !state.config.auth.configured) { showSetupNeeded(); return; }
+    const s = await fetch("/api/session");
+    if (s.status === 503) { showSetupNeeded(); return; }
+    if (s.status !== 200) { showLogin(); return; } // shown once
+    await startApp();
   } catch (e) {
     document.querySelector("main").innerHTML =
       `<div class="note err">تعذّر الاتصال بالخادم: ${escapeHtml(errText(e))}<br><span class="muted">تأكد من إتمام النشر على Cloudflare.</span></div>`;
