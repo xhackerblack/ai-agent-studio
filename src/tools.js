@@ -283,7 +283,8 @@ export const BUILTIN_TOOLS = [
       const r = await ctx.generateImage(prompt);
       const ev = r.evaluation;
       const score = ev && ev.evaluated ? ` — التقييم الذاتي: ${ev.overall}/5` : "";
-      return { id: r.id, url: r.url, evaluation: ev || null, note: `تم توليد الصورة وحفظها${score} — أخبر المستخدم أنها جاهزة بالأسفل` };
+      const niche = r.niche ? ` — النيتش: ${r.niche.icon} ${r.niche.label}` : "";
+      return { id: r.id, url: r.url, evaluation: ev || null, niche: r.niche || null, note: `تم توليد الصورة وحفظها${niche}${score} — أخبر المستخدم أنها جاهزة بالأسفل` };
     },
   },
 ];
