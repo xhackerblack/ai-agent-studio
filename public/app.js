@@ -254,6 +254,7 @@ function openAgentModal(a) {
     <div id="am-skills" class="chips"><span class="muted">جارٍ التحميل…</span></div>
     <p class="muted" style="font-size:13px;margin:0 0 6px">أضف مهارات جديدة من لوحة التحكم ← مكتبة المهارات</p>
     <label class="switch-row"><span>🧠 تعلّم ذاتي تلقائي <small class="muted">— بعد كل محادثة</small></span><button type="button" class="switch" id="am-autolearn" role="switch" aria-label="التعلم الذاتي"></button></label>
+    <label class="switch-row"><span>🖼️ تعلّم ذاتي للصور <small class="muted">— يقيّم كل صورة ويتعلم منها</small></span><button type="button" class="switch" id="am-imagelearn" role="switch" aria-label="التعلم الذاتي للصور"></button></label>
     <label class="switch-row"><span>🛰️ بحث تلقائي مستمر <small class="muted">— من الويب كل ٣٠ دقيقة</small></span><button type="button" class="switch" id="am-autoresearch" role="switch" aria-label="البحث التلقائي"></button></label>
     <div id="am-topics-row" class="hidden" style="margin-bottom:10px">
       <label class="muted" style="font-size:13px">مواضيع البحث (سطر لكل موضوع — تُبحث بالتناوب):</label>
@@ -274,10 +275,14 @@ function openAgentModal(a) {
   renderModalTools();
   modalSkillIds = [...(a?.skillIds || [])];
   modalAutoLearn = !!a?.autoLearn;
+  modalImageLearn = a?.imageLearn !== false;
   renderSkillChips();
   const autoSw = $("am-autolearn");
   autoSw.classList.toggle("on", modalAutoLearn);
   autoSw.onclick = () => { modalAutoLearn = !modalAutoLearn; autoSw.classList.toggle("on", modalAutoLearn); };
+  const imgLearnSw = $("am-imagelearn");
+  imgLearnSw.classList.toggle("on", modalImageLearn);
+  imgLearnSw.onclick = () => { modalImageLearn = !modalImageLearn; imgLearnSw.classList.toggle("on", modalImageLearn); };
   // Autonomous research
   modalAutoResearch = !!a?.autoResearch;
   const arSw = $("am-autoresearch");
@@ -308,7 +313,7 @@ function openAgentModal(a) {
   if (histBtn) histBtn.onclick = () => openHistorySheet(editingId);
   $("am-save").onclick = saveAgentModal;
 }
-let modalSkillIds = [], modalAutoLearn = false, modalAutoResearch = false, modalDeepThink = false, modalEffort = "balanced", skillsCache = null;
+let modalSkillIds = [], modalAutoLearn = false, modalImageLearn = true, modalAutoResearch = false, modalDeepThink = false, modalEffort = "balanced", skillsCache = null;
 async function getSkillsCache() {
   if (!skillsCache) skillsCache = (await api("/api/skills")).skills;
   return skillsCache;
@@ -357,7 +362,7 @@ async function saveAgentModal() {
     avatar: $("am-avatar").value || "🤖",
     description: $("am-desc").value, tone: $("am-tone").value,
     model: $("am-model").value, systemPrompt: $("am-prompt").value,
-    tools: modalTools, skillIds: modalSkillIds, autoLearn: modalAutoLearn,
+    tools: modalTools, skillIds: modalSkillIds, autoLearn: modalAutoLearn, imageLearn: modalImageLearn,
     autoResearch: modalAutoResearch,
     researchTopics: $("am-topics").value.split("\n").map((t) => t.trim()).filter(Boolean).slice(0, 10),
     deepThink: modalDeepThink, effort: modalEffort,
@@ -899,6 +904,7 @@ $("btn-train-open").onclick = () => {
 const KIND_COLORS = {
   agent: "#a78bfa", memory: "#8b5cf6", lesson: "#34d399", file: "#60a5fa",
   chunk: "#38bdf8", tool: "#fbbf24", skill: "#f472b6", event: "#f87171",
+  image: "#fb923c", eval: "#facc15",
 };
 /* 🐙 v2: memory nodes colored by their expert category */
 const CAT_COLORS = {
@@ -913,6 +919,7 @@ function nodeColor(n) {
 const KIND_AR = {
   agent: "الوكيل", memory: "ذاكرة دائمة", lesson: "درس مستخلص", file: "ملف تدريب",
   chunk: "مقطع معرفي", tool: "أداة", skill: "مهارة مدمجة", event: "حدث تعلّم",
+  image: "صورة مولدة", eval: "تقييم صورة",
 };
 
 const Brain = {
@@ -1216,7 +1223,7 @@ async function loadBrain(soft = false) {
 
 function updateBrainStats(data) {
   const s = data.stats;
-  const names = { memory: "🧠 ذاكرة", lesson: "💡 دروس", file: "📄 ملفات", tool: "🔧 أدوات", skill: "🧩 مهارات", event: "✨ أحداث" };
+  const names = { memory: "🧠 ذاكرة", lesson: "💡 دروس", file: "📄 ملفات", tool: "🔧 أدوات", skill: "🧩 مهارات", event: "✨ أحداث", image: "🖼️ صور", eval: "⭐ تقييمات" };
   let html = `<span class="bstat live"><span class="dot"></span>مباشر</span><span class="bstat"><b>${s.total}</b> عقدة</span>`;
   for (const [k, label] of Object.entries(names)) {
     if (s.counts[k]) html += `<span class="bstat"><b>${s.counts[k]}</b> ${label}</span>`;
@@ -1261,9 +1268,34 @@ function fillImageModels() {
 function recentImages() {
   try { return JSON.parse(localStorage.getItem("aas_imgs") || "[]"); } catch { return []; }
 }
-function saveRecentImage(id, prompt) {
-  const list = [{ id, prompt, at: Date.now() }, ...recentImages()].slice(0, 24);
+function saveRecentImage(id, prompt, evaluation) {
+  const list = [{ id, prompt, at: Date.now(), score: evaluation && evaluation.evaluated ? evaluation.overall : null }, ...recentImages()].slice(0, 24);
   try { localStorage.setItem("aas_imgs", JSON.stringify(list)); } catch { /* storage full */ }
+}
+/** HTML for the vision self-critique panel shown after each generation. */
+function evalPanelHTML(ev) {
+  if (!ev || !ev.evaluated) {
+    return `<div class="note" style="margin-top:10px">⏳ تعذّر التحليل الذاتي هذه المرة — ستُحفظ الصورة بدون تقييم.</div>`;
+  }
+  const critLabels = { composition: "التكوين", lines: "جودة الخطوط", artifacts: "خلو من العيوب", styleMatch: "مطابقة الوصف", finish: "الإتقان العام" };
+  const bars = Object.entries(ev.scores || {}).map(([k, v]) => {
+    const pct = Math.max(0, Math.min(100, (v / 5) * 100));
+    const color = v >= 4 ? "#34d399" : v >= 3 ? "#fbbf24" : "#f87171";
+    return `<div style="display:flex;align-items:center;gap:8px;margin:6px 0;font-size:13px">
+      <span style="width:90px">${critLabels[k] || k}</span>
+      <div style="flex:1;height:8px;border-radius:4px;background:#1e293b;overflow:hidden"><div style="width:${pct}%;height:100%;background:${color};border-radius:4px"></div></div>
+      <b>${v}/5</b></div>`;
+  }).join("");
+  const list = (arr, icon) => (arr || []).length
+    ? `<ul style="margin:6px 0;padding-inline-start:18px;font-size:13px">${arr.map((x) => `<li>${icon} ${escapeHtml(x)}</li>`).join("")}</ul>` : "";
+  return `<div class="card" style="margin-top:10px;border:1px solid #facc15">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+      <span style="font-size:22px">⭐</span><b>التقييم الذاتي: ${ev.overall}/5</b>
+      <small class="muted">— حلّلها النموذج البصري وحفظ الدرس في الذاكرة</small>
+    </div>${bars}
+    ${list(ev.strengths, "✅")}${list(ev.issues, "⚠️")}
+    ${ev.lesson ? `<div class="note" style="margin-top:6px">💡 <b>درس مستخلص:</b> ${escapeHtml(ev.lesson)}</div>` : ""}
+  </div>`;
 }
 function renderGallery() {
   const g = $("img-gallery");
@@ -1271,13 +1303,22 @@ function renderGallery() {
   const list = recentImages();
   g.innerHTML = list.length ? "" : '<p class="muted">لا صور بعد — ولّد أول صورة! ✨</p>';
   for (const it of list) {
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "position:relative;display:inline-block";
     const img = document.createElement("img");
     img.src = "/api/images/" + it.id;
     img.loading = "lazy";
     img.alt = it.prompt || "صورة مولدة";
     img.title = it.prompt || "";
     img.onclick = () => openViewer(img.src);
-    g.appendChild(img);
+    wrap.appendChild(img);
+    if (it.score != null) {
+      const badge = document.createElement("span");
+      badge.textContent = `⭐ ${it.score}`;
+      badge.style.cssText = "position:absolute;top:6px;inset-inline-start:6px;background:rgba(0,0,0,.65);color:#facc15;font-size:12px;font-weight:700;padding:2px 8px;border-radius:10px";
+      wrap.appendChild(badge);
+    }
+    g.appendChild(wrap);
   }
 }
 
@@ -1299,17 +1340,17 @@ function initImageStudio() {
     try {
       const r = await api("/api/generate-image", {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ prompt, model: $("img-model").value }),
+        body: JSON.stringify({ prompt, model: $("img-model").value, agentId: state.currentAgent }),
       });
       st.classList.add("hidden");
-      saveRecentImage(r.id, prompt);
+      saveRecentImage(r.id, prompt, r.evaluation);
       resBox.classList.remove("hidden");
       resBox.innerHTML = `<div class="card img-result-card">
         <img class="gen-img" id="img-latest" src="${r.url}" alt="صورة مولدة">
         <div class="row" style="margin-top:10px">
           <button class="btn primary" id="img-dl" style="flex:1">⬇️ تحميل</button>
           <button class="btn" id="img-view" style="flex:1">🔍 عرض مكبّر</button>
-        </div></div>`;
+        </div></div>` + evalPanelHTML(r.evaluation);
       $("img-view").onclick = () => openViewer(r.url);
       $("img-latest").onclick = () => openViewer(r.url);
       $("img-dl").onclick = async () => {
@@ -1327,7 +1368,7 @@ function initImageStudio() {
         } catch { window.open(r.url, "_blank"); }
       };
       renderGallery();
-      toast("تم توليد الصورة! 🎨");
+      toast(r.evaluation && r.evaluation.evaluated ? `تم توليد الصورة! 🎨 التقييم الذاتي: ${r.evaluation.overall}/5 ⭐` : "تم توليد الصورة! 🎨");
     } catch (e) {
       st.className = "note err";
       st.textContent = "❌ " + errText(e);
