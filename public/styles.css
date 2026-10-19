@@ -814,3 +814,50 @@ canvas#dash-chart { width: 100%; }
   font: inherit;
 }
 .rs-q { font-weight: 700; }
+
+/* ---------- Live activity ticker ---------- */
+.ticker-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: linear-gradient(135deg, #101c2e, #16283f);
+  border: 1px solid #274a6b;
+  border-radius: 14px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+.ticker-label {
+  white-space: nowrap;
+  font-weight: 800;
+  font-size: 13px;
+  color: #7ee2a8;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ticker-label::after {
+  content: "";
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: #2fd671;
+  animation: blink 1.6s ease-in-out infinite;
+}
+@keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+.ticker { overflow: hidden; flex: 1; direction: rtl; }
+.ticker-track {
+  display: inline-flex;
+  align-items: center;
+  gap: 28px;
+  white-space: nowrap;
+  animation: tickmove 45s linear infinite;
+  will-change: transform;
+}
+.ticker:hover .ticker-track { animation-play-state: paused; }
+@keyframes tickmove {
+  from { transform: translateX(0); }
+  to { transform: translateX(50%); }
+}
+.ticker-item { font-size: 13.5px; color: #cfe3f5; }
+.ticker-item b { color: #fff; }
+.ticker-sep { color: #4a7ba6; font-size: 12px; }
