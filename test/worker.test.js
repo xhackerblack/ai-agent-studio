@@ -528,33 +528,58 @@ test("tool chains: decider can use two tools in sequence", async () => {
 
 /* ---------- web_search tool ---------- */
 
-test("web_search falls back to wikipedia with shaped results", async () => {
+test("web_search fans out across live sources with engines listed", async () => {
   const tool = getBuiltinTool("web_search");
   assert.ok(tool);
   const ctx = {
     fetch: async (url) => {
-      if (String(url).includes("duckduckgo")) return { ok: false };
-      return {
+      const u = String(url);
+      if (u.includes("duckduckgo")) return { ok: false };
+      if (u.includes("hn.algolia")) return {
+        ok: true,
+        json: async () => ({ hits: [{ title: "AI news", url: "https://example.com/ai", points: 10, num_comments: 5, objectID: "1" }] }),
+      };
+      if (u.includes("stackexchange")) return { ok: true, json: async () => ({ items: [] }) };
+      if (u.includes("ar.wikipedia")) return {
         ok: true,
         json: async () => ({ query: { search: [{ title: "ذهب", snippet: "معدن <b>ثمين</b>" }] } }),
       };
+      return { ok: true, json: async () => ({ query: { search: [] } }) };
     },
+    env: {},
   };
   const out = await tool.run({ query: "ذهب" }, ctx);
-  assert.equal(out.source, "wikipedia");
-  assert.equal(out.results[0].title, "ذهب");
-  assert.ok(out.results[0].url.includes("wikipedia.org"));
-  assert.ok(!out.results[0].snippet.includes("<b>"));
+  assert.ok(out.count >= 2);
+  assert.ok(out.engines.includes("wikipedia-ar"));
+  assert.ok(out.engines.includes("hackernews"));
+  const wiki = out.results.find((r) => r.source === "wikipedia-ar");
+  assert.equal(wiki.title, "ذهب");
+  assert.ok(wiki.snippet && !wiki.snippet.includes("<b>"));
+  assert.ok(wiki.url.includes("wikipedia.org"));
 });
 
 test("web_search parses duckduckgo results when available", async () => {
   const tool = getBuiltinTool("web_search");
   const html = '<a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fx">عنوان <b>مهم</b></a>';
-  const ctx = { fetch: async () => ({ ok: true, text: async () => html }) };
+  const ctx = {
+    fetch: async (url) => {
+      if (String(url).includes("duckduckgo")) return { ok: true, text: async () => html };
+      return { ok: false };
+    },
+    env: {},
+  };
   const out = await tool.run({ query: "x" }, ctx);
-  assert.equal(out.source, "duckduckgo");
-  assert.equal(out.results[0].url, "https://example.com/x");
-  assert.ok(out.results[0].title.includes("عنوان"));
+  const ddg = out.results.find((r) => r.source === "duckduckgo");
+  assert.ok(ddg);
+  assert.equal(ddg.url, "https://example.com/x");
+  assert.ok(ddg.title.includes("عنوان"));
+});
+
+test("web_search tolerates all sources failing", async () => {
+  const tool = getBuiltinTool("web_search");
+  const out = await tool.run({ query: "x" }, { fetch: async () => ({ ok: false }), env: {} });
+  assert.equal(out.count, 0);
+  assert.deepEqual(out.results, []);
 });
 
 /* ---------- export / import / backup ---------- */
@@ -993,4 +1018,55 @@ test("research dedupes sources by URL", async () => {
     // 2 unique pages (gold + silver), the ?a=2 duplicate collapsed
     assert.equal(research[0].webSources, 2);
   } finally { globalThis.fetch = real; }
+});
+
+test("research refresh re-runs and updates the record", async () => {
+  const env = researchEnv();
+  const restore = stubFetch();
+  try {
+    const { agent } = await (await postJson(env, "/api/agents", { name: "RR" })).json();
+    await (await postJson(env, "/api/chat", { agentId: agent.id, message: "ابحث بعمق عن الذهب" })).text();
+    const before = await (await api(env, `/api/research/${agent.id}`)).json();
+    assert.equal(before.research.length, 1);
+    const recId = before.research[0].id;
+    const res = await postJson(env, "/api/research/refresh", { agentId: agent.id, query: "الذهب", refreshId: recId });
+    assert.equal(res.status, 200);
+    const { rec, report } = await res.json();
+    assert.equal(rec.id, recId);
+    assert.equal(rec.refreshCount, 1);
+    assert.ok(rec.updatedAt);
+    assert.ok(Array.isArray(rec.sources));
+    assert.ok(report.length > 50);
+    const after = await (await api(env, `/api/research/${agent.id}`)).json();
+    assert.equal(after.research.length, 1); // refreshed in place, not duplicated
+    assert.equal(after.research[0].refreshCount, 1);
+  } finally { restore(); }
+});
+
+test("research refresh without id creates a new record", async () => {
+  const env = researchEnv();
+  const restore = stubFetch();
+  try {
+    const { agent } = await (await postJson(env, "/api/agents", { name: "RR2" })).json();
+    const res = await postJson(env, "/api/research/refresh", { agentId: agent.id, query: "الفضة" });
+    assert.equal(res.status, 200);
+    const { rec } = await res.json();
+    assert.equal(rec.refreshCount, 0);
+    assert.ok(rec.query.includes("الفضة"));
+  } finally { restore(); }
+});
+
+test("research lessons keep their source urls", async () => {
+  const env = researchEnv();
+  const restore = stubFetch();
+  try {
+    const { agent } = await (await postJson(env, "/api/agents", { name: "RL" })).json();
+    await (await postJson(env, "/api/chat", { agentId: agent.id, message: "ابحث بعمق عن الذهب" })).text();
+    const kv = env.STUDIO_KV;
+    const raw = await kv.get(`learned:${agent.id}`);
+    const learned = JSON.parse(raw);
+    const rl = learned.filter((l) => l.source === "research");
+    assert.ok(rl.length >= 1);
+    assert.ok(Array.isArray(rl[0].urls));
+  } finally { restore(); }
 });
