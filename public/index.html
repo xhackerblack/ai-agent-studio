@@ -63,6 +63,7 @@
     <div class="chat-top">
       <select id="chat-agent" aria-label="الوكيل"></select>
       <button class="btn icon-btn" id="btn-new-conv" title="محادثة جديدة">＋</button>
+      <button class="btn icon-btn" id="btn-share-conv" title="مشاركة المحادثة">↗️</button>
     </div>
     <select id="chat-conv" class="conv-select" aria-label="المحادثة"></select>
     <div id="chat-log" class="chat-log"></div>
@@ -124,6 +125,24 @@
       <canvas id="dash-chart" height="140"></canvas>
     </div>
     <div class="card">
+      <h3>📊 نشاط الوكلاء اليوم</h3>
+      <div id="dash-peragent" class="stack"><div class="skel"></div></div>
+    </div>
+    <div class="card">
+      <h3>💡 اقتراحات تدريب ذكية</h3>
+      <div id="dash-gaps" class="stack"><div class="skel"></div></div>
+    </div>
+    <div class="card">
+      <h3>💾 النسخ الاحتياطي</h3>
+      <p class="muted" style="font-size:13px;margin:0 0 8px">كل الوكلاء + المهارات + الأدوات المخصصة في ملف واحد.</p>
+      <div class="row">
+        <button class="btn" id="btn-backup-dl">⬇️ تنزيل نسخة</button>
+        <button class="btn" id="btn-backup-up">⬆️ استعادة</button>
+        <input type="file" id="backup-file" accept=".json" class="hidden">
+      </div>
+      <div id="backup-status" class="note hidden"></div>
+    </div>
+    <div class="card">
       <h3>🧠 سجل التعلّم الذاتي</h3>
       <select id="learn-agent" aria-label="وكيل السجل"></select>
       <div id="learn-log" class="timeline"></div>
@@ -148,7 +167,7 @@
       <button class="btn block" id="btn-custom-tool-open">＋ أداة مخصصة (API خارجي)</button>
     </div>
     <div class="card">
-      <h3>⏰ التذكيرات</h3>
+      <h3>⏰ التذكيرات <button class="btn small" id="btn-notif" style="margin-inline-start:8px">🔔 تفعيل التنبيهات</button></h3>
       <select id="rem-agent" aria-label="وكيل التذكيرات"></select>
       <div id="rem-list" class="stack"></div>
     </div>
