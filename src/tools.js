@@ -84,6 +84,26 @@ export const BUILTIN_TOOLS = [
     async run(args, ctx) {
       const url = String(args.url || "").trim();
       if (!/^https?:\/\//i.test(url)) throw new Error("رابط غير صالح");
+      // Cache API (not KV): fetched pages cached 6h to save subrequests.
+      const cacheKey = new Request(`https://cache.local/urlfetch?u=${encodeURIComponent(url)}`);
+      const useCache = typeof caches !== "undefined";
+      const cachePut = (obj) => {
+        if (!useCache) return;
+        try {
+          caches.default.put(cacheKey, new Response(JSON.stringify(obj), {
+            headers: { "Content-Type": "application/json", "Cache-Control": "max-age=21600" },
+          })).catch(() => {});
+        } catch { /* best-effort */ }
+      };
+      if (useCache) {
+        try {
+          const hit = await caches.default.match(cacheKey);
+          if (hit) {
+            const d = await hit.json().catch(() => null);
+            if (d && d.text) return { ...d, cached: true };
+          }
+        } catch { /* best-effort */ }
+      }
       // Wikipedia: use the API extracts endpoint (article HTML is often
       // blocked for cloud IPs, while the API works reliably)
       const wm = url.match(/^https:\/\/([a-z-]{2,12})\.wikipedia\.org\/wiki\/([^?#]+)$/);
@@ -99,7 +119,7 @@ export const BUILTIN_TOOLS = [
             const pages = d?.query?.pages || {};
             const first = Object.values(pages)[0] || {};
             const text = String(first.extract || "").replace(/\s+/g, " ").trim().slice(0, 6000);
-            if (text.length > 200) return { url, text, via: "wikipedia-api" };
+            if (text.length > 200) { const o = { url, text, via: "wikipedia-api" }; cachePut(o); return o; }
           }
         } catch { /* fall through to HTML fetch */ }
       }
@@ -116,7 +136,7 @@ export const BUILTIN_TOOLS = [
         .replace(/\s+/g, " ")
         .trim()
         .slice(0, 6000);
-      return { url, text };
+      const o = { url, text }; cachePut(o); return o;
     },
   },
   {
@@ -173,6 +193,18 @@ export const BUILTIN_TOOLS = [
       const q = String(args.query || "").trim().slice(0, 200);
       if (!q) throw new Error("query مطلوب");
       const F = ctx.fetch;
+      // Cache API (not KV): search results are cached 30 min to save subrequests.
+      const cacheKey = new Request(`https://cache.local/websearch?q=${encodeURIComponent(q)}`);
+      const useCache = typeof caches !== "undefined";
+      if (useCache) {
+        try {
+          const hit = await caches.default.match(cacheKey);
+          if (hit) {
+            const d = await hit.json().catch(() => null);
+            if (d && Array.isArray(d.results)) return { ...d, cached: true };
+          }
+        } catch { /* cache is best-effort */ }
+      }
       const UA = "AI-Agent-Studio/2.0";
       const withTimeout = (ms) => ({ headers: { "user-agent": UA }, signal: AbortSignal.timeout(ms) });
       const clean = (s) => String(s || "").replace(/<[^>]+>/g, "").replace(/&[^;]+;/g, " ").trim().slice(0, 220);
@@ -268,7 +300,15 @@ export const BUILTIN_TOOLS = [
         if (results.length >= 10) break;
       }
       const engines = [...new Set(results.map((r) => r.source))];
-      return { query: q, results, engines, count: results.length };
+      const payload = { query: q, results, engines, count: results.length };
+      if (useCache) {
+        try {
+          caches.default.put(cacheKey, new Response(JSON.stringify(payload), {
+            headers: { "Content-Type": "application/json", "Cache-Control": "max-age=1800" },
+          })).catch(() => {});
+        } catch { /* best-effort */ }
+      }
+      return payload;
     },
   },
   {
