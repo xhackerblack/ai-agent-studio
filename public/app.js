@@ -243,12 +243,26 @@ function openAgentModal(a) {
     <select id="am-model">${(state.config?.models || []).map((m) =>
       `<option value="${m.id}" ${a?.model === m.id ? "selected" : ""}>${escapeHtml(m.label)}</option>`).join("")}</select>
     <textarea id="am-prompt" rows="4" placeholder="تعليمات النظام — شخصية الوكيل وخبرته">${escapeHtml(a?.systemPrompt || "")}</textarea>
+    <h3>👤 ملف الشخصية</h3>
+    <input id="am-expertise" placeholder="مجال الخبرة (مثال: تسويق رقمي، طبخ)" value="${escapeHtml(a?.expertise || "")}">
+    <input id="am-style" placeholder="أسلوب الرد (مثال: مباشر، قصصي، أكاديمي)" value="${escapeHtml(a?.style || "")}">
+    <input id="am-avoid" placeholder="مواضيع يتجنبها (مثال: سياسة، نصائح طبية)" value="${escapeHtml(a?.avoidTopics || "")}">
     <h3>🧰 الأدوات المفعّلة</h3>
     <div id="am-tools" class="chips"></div>
     <h3>🧩 المهارات المدمجة</h3>
     <div id="am-skills" class="chips"><span class="muted">جارٍ التحميل…</span></div>
     <p class="muted" style="font-size:13px;margin:0 0 6px">أضف مهارات جديدة من لوحة التحكم ← مكتبة المهارات</p>
     <label class="switch-row"><span>🧠 تعلّم ذاتي تلقائي <small class="muted">— بعد كل محادثة</small></span><button type="button" class="switch" id="am-autolearn" role="switch" aria-label="التعلم الذاتي"></button></label>
+    <label class="switch-row"><span>🔬 تفكير عميق <small class="muted">— تحليل + نقد ذاتي (يستهلك خلايا أكثر)</small></span><button type="button" class="switch" id="am-deepthink" role="switch" aria-label="التفكير العميق"></button></label>
+    <div id="am-effort-row" class="hidden" style="margin-bottom:10px">
+      <label class="muted" style="font-size:13px">مستوى الجهد:</label>
+      <select id="am-effort">
+        <option value="fast">⚡ سريع — بدون تفكير مرئي</option>
+        <option value="balanced">⚖️ متوازن — تفكير مختصر</option>
+        <option value="deep">🔬 عميق — تفكير + نقد ذاتي</option>
+      </select>
+    </div>
+    ${a ? '<button class="btn ghost big" id="am-history" style="margin-bottom:8px">🕘 سجل الإصدارات والتراجع</button>' : ""}
     <button class="btn primary big" id="am-save">💾 حفظ الوكيل</button>`);
   renderModalTools();
   modalSkillIds = [...(a?.skillIds || [])];
@@ -257,9 +271,26 @@ function openAgentModal(a) {
   const autoSw = $("am-autolearn");
   autoSw.classList.toggle("on", modalAutoLearn);
   autoSw.onclick = () => { modalAutoLearn = !modalAutoLearn; autoSw.classList.toggle("on", modalAutoLearn); };
+  // Deep think
+  modalDeepThink = !!a?.deepThink;
+  modalEffort = a?.effort || "balanced";
+  const dtSw = $("am-deepthink");
+  const effRow = $("am-effort-row");
+  const effSel = $("am-effort");
+  dtSw.classList.toggle("on", modalDeepThink);
+  effRow.classList.toggle("hidden", !modalDeepThink);
+  effSel.value = modalEffort;
+  dtSw.onclick = () => {
+    modalDeepThink = !modalDeepThink;
+    dtSw.classList.toggle("on", modalDeepThink);
+    effRow.classList.toggle("hidden", !modalDeepThink);
+  };
+  effSel.onchange = () => { modalEffort = effSel.value; };
+  const histBtn = $("am-history");
+  if (histBtn) histBtn.onclick = () => openHistorySheet(editingId);
   $("am-save").onclick = saveAgentModal;
 }
-let modalSkillIds = [], modalAutoLearn = false, skillsCache = null;
+let modalSkillIds = [], modalAutoLearn = false, modalDeepThink = false, modalEffort = "balanced", skillsCache = null;
 async function getSkillsCache() {
   if (!skillsCache) skillsCache = (await api("/api/skills")).skills;
   return skillsCache;
@@ -309,6 +340,8 @@ async function saveAgentModal() {
     description: $("am-desc").value, tone: $("am-tone").value,
     model: $("am-model").value, systemPrompt: $("am-prompt").value,
     tools: modalTools, skillIds: modalSkillIds, autoLearn: modalAutoLearn,
+    deepThink: modalDeepThink, effort: modalEffort,
+    expertise: $("am-expertise").value, style: $("am-style").value, avoidTopics: $("am-avoid").value,
   };
   try {
     if (editingId) await api(`/api/agents/${editingId}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
@@ -411,7 +444,112 @@ function addMsg(role, content, tools = [], images = [], instant = false) {
   }
   log.appendChild(d);
   if (!instant) log.scrollTop = log.scrollHeight;
+  attachLinkPreviews(d, content);
   return d;
+}
+
+/* Link previews: fetch the page title for the first URL in a message */
+const previewCache = new Map();
+function attachLinkPreviews(el, text) {
+  const m = String(text || "").match(/https?:\/\/[^\s<>"')\]]+/);
+  if (!m) return;
+  const url = m[0].replace(/[.,;:!?]+$/, "");
+  const render = (title) => {
+    if (!title || el.querySelector(".link-preview")) return;
+    const a = document.createElement("a");
+    a.className = "link-preview";
+    a.href = url; a.target = "_blank"; a.rel = "noopener";
+    const host = url.replace(/^https?:\/\//, "").split("/")[0];
+    a.innerHTML = '<span class="lp-icon">🔗</span><span class="lp-text"><span class="lp-title"></span><span class="lp-url"></span></span>';
+    a.querySelector(".lp-title").textContent = title;
+    a.querySelector(".lp-url").textContent = host;
+    el.appendChild(a);
+  };
+  if (previewCache.has(url)) { render(previewCache.get(url)); return; }
+  api(`/api/preview?url=${encodeURIComponent(url)}`)
+    .then((r) => {
+      const t = (r && r.title) || "";
+      previewCache.set(url, t);
+      if (previewCache.size > 60) previewCache.delete(previewCache.keys().next().value);
+      render(t);
+    })
+    .catch(() => { /* no preview */ });
+}
+
+/* Deep-thinking box: collapsible, survives the streamed answer */
+function handleThinkingEvent(botEl, obj) {
+  let box = botEl._thinkEl || null;
+  if (obj.state === "start") {
+    if (!box) {
+      box = document.createElement("details");
+      box.className = "thinking";
+      box.open = true;
+      box.innerHTML = '<summary>🧠 <span class="think-label">يفكر بعمق…</span></summary><div class="think-body"><span class="typing"><span></span><span></span><span></span></span></div>';
+      botEl.prepend(box);
+      botEl._thinkEl = box;
+    } else {
+      box.open = true;
+    }
+    const lbl = box.querySelector(".think-label");
+    if (lbl) lbl.textContent = obj.effort === "deep" ? "يفكر بعمق — ثم يراجع نفسه…" : "يفكر بعمق…";
+  } else if (obj.state === "critique") {
+    const lbl = box && box.querySelector(".think-label");
+    if (lbl) lbl.textContent = "🔬 يراجع إجابته ويحسّنها…";
+  } else if (obj.state === "done") {
+    if (box) {
+      const lbl = box.querySelector(".think-label");
+      if (lbl) lbl.textContent = "🧠 التفكير العميق";
+      const body = box.querySelector(".think-body");
+      if (body) body.textContent = obj.text || "";
+      box.open = false;
+    }
+  } else if (obj.state === "error") {
+    if (box) box.remove();
+    botEl._thinkEl = null;
+  }
+  const log = $("chat-log");
+  if (log) log.scrollTop = log.scrollHeight;
+}
+
+/* Agent version history */
+async function openHistorySheet(agentId) {
+  openSheet('<h2>🕘 سجل إصدارات الوكيل</h2><div id="hist-list"><div class="skel"></div><div class="skel"></div></div>');
+  try {
+    const { history } = await api(`/api/agents/${agentId}/history`);
+    const box = $("hist-list");
+    if (!history.length) {
+      box.innerHTML = '<p class="muted">لا إصدارات محفوظة بعد — تُحفظ نسخة تلقائياً عند كل تعديل.</p>';
+      return;
+    }
+    box.innerHTML = "";
+    for (const h of history) {
+      const row = document.createElement("div");
+      row.className = "hist-row";
+      const info = document.createElement("div");
+      info.innerHTML = `<b></b><br><small class="muted"></small>`;
+      info.querySelector("b").textContent = h.name || "نسخة";
+      info.querySelector("small").textContent = new Date(h.at).toLocaleString("ar");
+      const btn = document.createElement("button");
+      btn.className = "btn small";
+      btn.textContent = "↩️ استعادة";
+      btn.onclick = async () => {
+        if (await confirmDialog("استعادة هذه النسخة؟", "سيتم إرجاع إعدادات الوكيل إلى هذه النسخة.")) {
+          try {
+            await api(`/api/agents/${agentId}/rollback`, {
+              method: "POST", headers: { "content-type": "application/json" },
+              body: JSON.stringify({ index: h.index }),
+            });
+            toast("تمت الاستعادة ✅");
+            closeSheet(); loadAgents();
+          } catch (e) { toast(errText(e), true); }
+        }
+      };
+      row.appendChild(info); row.appendChild(btn);
+      box.appendChild(row);
+    }
+  } catch (e) {
+    $("hist-list").innerHTML = `<div class="note err">${escapeHtml(errText(e))}</div>`;
+  }
 }
 
 /** Fullscreen image viewer */
@@ -449,6 +587,27 @@ async function newConversation() {
 }
 $("btn-new-conv").onclick = newConversation;
 
+/* Share current conversation as formatted text */
+$("btn-share-conv").onclick = async () => {
+  const id = state.currentConv;
+  if (!id) return toast("لا توجد محادثة لمشاركتها", true);
+  try {
+    const { conversation } = await api(`/api/conversations/detail?id=${encodeURIComponent(id)}`);
+    const agent = state.agents.find((a) => a.id === state.currentAgent);
+    let txt = `💬 محادثة مع ${agent ? agent.avatar + " " + agent.name : "الوكيل"}\n========================\n\n`;
+    for (const m of conversation.messages || []) {
+      txt += (m.role === "user" ? "🧑 أنت:\n" : "🤖 الوكيل:\n") + m.content + "\n\n";
+    }
+    txt += "— عبر AI Agent Studio";
+    if (navigator.share) {
+      await navigator.share({ title: "محادثة", text: txt });
+    } else {
+      await navigator.clipboard.writeText(txt);
+      toast("نُسخت المحادثة — الصقها أينما شئت 📋");
+    }
+  } catch (e) { toast(errText(e), true); }
+};
+
 async function sendMessage() {
   const input = $("chat-text");
   const text = input.value.trim();
@@ -482,11 +641,22 @@ async function sendMessage() {
         if (!line.startsWith("data:")) continue;
         const obj = JSON.parse(line.slice(5));
         if (obj.type === "token") {
-          if (first) { botEl.textContent = ""; first = false; }
-          full += obj.text; botEl.textContent = full;
+          if (first) {
+            first = false;
+            // Clear the typing indicator but keep the thinking box
+            const th = botEl._thinkEl || null;
+            botEl.textContent = "";
+            if (th) botEl.appendChild(th);
+            const s = document.createElement("span");
+            botEl.appendChild(s);
+            botEl._textEl = s;
+          }
+          full += obj.text;
+          (botEl._textEl || botEl).textContent = full;
           $("chat-log").scrollTop = $("chat-log").scrollHeight;
         }
         else if (obj.type === "tool") { $("chat-tools").textContent = `🔧 يستخدم: ${obj.icon} ${obj.label}…`; }
+        else if (obj.type === "thinking") { handleThinkingEvent(botEl, obj); }
         else if (obj.type === "conversation") { state.currentConv = obj.id; }
         else if (obj.type === "done") {
           for (const id of obj.images || []) {
@@ -506,7 +676,7 @@ async function sendMessage() {
         else if (obj.type === "error") throw Object.assign(new Error(obj.code || "upstream"), { code: obj.code, detail: obj.detail || "" });
       }
     }
-    if (!full) botEl.innerHTML = '<span class="muted">رد فارغ — حاول مجدداً</span>';
+    if (!full && !botEl._thinkEl) botEl.innerHTML = '<span class="muted">رد فارغ — حاول مجدداً</span>';
     $("chat-tools").textContent = "";
     loadConversations();
   } catch (e) {
@@ -1105,8 +1275,101 @@ async function loadDashboard() {
       <div class="card"><h3>🔧 الأدوات اليوم</h3><b style="font-size:26px">${s.today.toolCalls}</b></div>
       <div class="card"><h3>⚡ خلايا اليوم</h3><b style="font-size:26px">${s.today.neurons.toLocaleString("ar")}</b></div>`;
     drawChart(s.series);
+    renderPerAgent(s.perAgent);
   } catch (e) { cards.innerHTML = `<div class="note err">${escapeHtml(errText(e))}</div>`; }
   loadLearnLog(); loadKnowledge(); loadTools(); loadReminders(); loadSkills();
+  loadGaps(); initBackup();
+}
+
+function renderPerAgent(perAgent) {
+  const box = $("dash-peragent");
+  if (!box) return;
+  const active = (perAgent || []).filter((r) => r.messages > 0);
+  if (!active.length) {
+    box.innerHTML = '<p class="muted">لا نشاط اليوم بعد — تحدث مع وكلائك وستظهر هنا.</p>';
+    return;
+  }
+  box.innerHTML = "";
+  for (const r of active.slice(0, 8)) {
+    const row = document.createElement("div");
+    row.className = "pa-row";
+    row.innerHTML = `<span></span><b></b>`;
+    row.children[0].innerHTML = `${escapeHtml(r.avatar)} ${escapeHtml(r.name)}${r.quality != null ? ` <small class="muted">⭐ ${r.quality}/5</small>` : ""}`;
+    row.children[1].textContent = `${r.messages} رسالة`;
+    box.appendChild(row);
+  }
+}
+
+/* Smart training suggestions from knowledge gaps */
+async function loadGaps() {
+  const box = $("dash-gaps");
+  if (!box) return;
+  try {
+    const { gaps } = await api("/api/gaps");
+    if (!gaps.length) {
+      box.innerHTML = '<p class="muted">لا فجوات مرصودة — الوكلاء يتعلمون تلقائياً من المحادثات.</p>';
+      return;
+    }
+    box.innerHTML = "";
+    for (const g of gaps.slice(0, 5)) {
+      const row = document.createElement("div");
+      row.className = "gap-row";
+      const info = document.createElement("div");
+      info.innerHTML = `<b></b><br><small class="muted"></small>`;
+      info.querySelector("b").textContent = `${g.avatar || "🤖"} ${g.agentName}`;
+      info.querySelector("small").textContent = g.detail;
+      const btn = document.createElement("button");
+      btn.className = "btn small";
+      btn.textContent = "📄 درّبه";
+      btn.onclick = () => {
+        setChatAgent(g.agentId);
+        showView("chat");
+        setTimeout(() => $("btn-train-open").click(), 400);
+      };
+      row.appendChild(info); row.appendChild(btn);
+      box.appendChild(row);
+    }
+  } catch { box.innerHTML = '<p class="muted">تعذّر التحميل</p>'; }
+}
+
+/* Full backup: download + restore */
+function initBackup() {
+  const dl = $("btn-backup-dl"), up = $("btn-backup-up"), fi = $("backup-file"), st = $("backup-status");
+  if (!dl || dl.dataset.init) return;
+  dl.dataset.init = "1";
+  dl.onclick = async () => {
+    try {
+      const b = await api("/api/backup");
+      const blob = new Blob([JSON.stringify(b)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `ai-agent-studio-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      toast("تم تنزيل النسخة الاحتياطية 💾");
+    } catch (e) { toast(errText(e), true); }
+  };
+  up.onclick = () => fi.click();
+  fi.onchange = async () => {
+    const f = fi.files[0];
+    if (!f) return;
+    st.classList.remove("hidden");
+    st.textContent = "جارٍ الاستعادة…";
+    try {
+      const backup = JSON.parse(await f.text());
+      const r = await api("/api/backup/import", {
+        method: "POST", headers: headers({ "content-type": "application/json" }),
+        body: JSON.stringify({ backup }),
+      });
+      st.textContent = `تمت استعادة ${r.agents} وكيل ✅`;
+      st.className = "note ok";
+      loadAgents();
+    } catch (e) {
+      st.textContent = errText(e);
+      st.className = "note err";
+    }
+    fi.value = "";
+  };
 }
 
 function drawChart(series) {
@@ -1250,6 +1513,44 @@ async function loadReminders() {
 }
 $("rem-agent").onchange = loadReminders;
 
+/* Reminder notifications: poll due reminders while the app is open */
+function initNotifications() {
+  const btn = $("btn-notif");
+  if (!btn || btn.dataset.init) return;
+  btn.dataset.init = "1";
+  const refreshLabel = () => {
+    btn.textContent = ("Notification" in window && Notification.permission === "granted")
+      ? "🔔 التنبيهات مفعّلة" : "🔔 تفعيل التنبيهات";
+  };
+  refreshLabel();
+  btn.onclick = async () => {
+    if (!("Notification" in window)) return toast("المتصفح لا يدعم التنبيهات", true);
+    const p = await Notification.requestPermission();
+    refreshLabel();
+    toast(p === "granted" ? "تم تفعيل التنبيهات 🔔" : "لم تُمنح صلاحية التنبيهات", p !== "granted");
+  };
+  const check = async () => {
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+    try {
+      for (const a of state.agents.slice(0, 10)) {
+        const { reminders } = await api(`/api/reminders/${a.id}`);
+        const now = Date.now();
+        for (const r of reminders || []) {
+          if (r.done || !r.dueAt) continue;
+          const t = new Date(r.dueAt).getTime();
+          if (isNaN(t) || t > now) continue;
+          const key = `aas_notified_${r.id}`;
+          if (localStorage.getItem(key)) continue;
+          localStorage.setItem(key, "1");
+          new Notification("⏰ تذكير", { body: `${a.avatar} ${a.name}: ${r.text}`, tag: r.id });
+        }
+      }
+    } catch { /* silent */ }
+  };
+  setInterval(check, 60000);
+  setTimeout(check, 15000);
+}
+
 /* ---------- Settings ---------- */
 async function loadSettings() {
   const id = $("mem-agent").value || state.currentAgent;
@@ -1304,6 +1605,7 @@ $("btn-save-pw").onclick = () => {
   try {
     state.config = await api("/api/config");
     initImageStudio();
+    initNotifications();
     await loadAgents();
     if (!state.agents.length) {
       try {
