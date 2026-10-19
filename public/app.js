@@ -828,11 +828,15 @@ function handleResearchEvent(botEl, obj) {
       dt.textContent = obj.hits ? `${obj.hits} نتائج${files ? ` — ${files}` : ""}` : "لا نتائج";
     } else if (obj.stage === "web") {
       const n = (obj.sources || []).length;
-      dt.textContent = n ? `${n} مصادر` : "لا مصادر جديدة";
+      const engines = (obj.engines || []).map((e) => {
+        const names = { "wikipedia-ar": "ويكيبيديا عربي", "wikipedia-en": "ويكيبيديا", "hackernews": "Hacker News", "stackoverflow": "StackOverflow", "duckduckgo": "DuckDuckGo", "brave": "Brave" };
+        return names[e] || e;
+      }).join("، ");
+      dt.textContent = n ? `${n} مصادر حية${engines ? ` عبر ${engines}` : ""}` : "لا مصادر جديدة";
       if (n && !row.querySelector(".rm-chips")) {
         const chips = document.createElement("div");
         chips.className = "rm-chips";
-        for (const s of obj.sources.slice(0, 4)) {
+        for (const s of obj.sources.slice(0, 6)) {
           const a = document.createElement("a");
           a.href = s.url; a.target = "_blank"; a.rel = "noopener";
           a.className = "rm-chip";
@@ -842,7 +846,10 @@ function handleResearchEvent(botEl, obj) {
         row.appendChild(chips);
       }
     } else if (obj.stage === "learn") {
-      dt.textContent = obj.lessons ? `حُفظت ${obj.lessons} دروس في العقل 🧠` : "اكتمل";
+      const srcN = obj.sources || 0;
+      dt.textContent = obj.lessons
+        ? `حُفظت ${obj.lessons} دروس في العقل 🧠${srcN ? ` من ${srcN} مصادر حية` : ""}`
+        : "اكتمل";
     } else {
       dt.textContent = "اكتمل";
     }
@@ -1479,16 +1486,47 @@ async function loadResearchHistory() {
       const d = document.createElement("button");
       d.className = "rs-row";
       d.innerHTML = `<div class="rs-q"></div><small class="muted"></small>`;
-      d.querySelector(".rs-q").textContent = `🔬 ${r.query}`;
+      d.querySelector(".rs-q").textContent = `🔬 ${r.query}${r.refreshCount ? ` (محدّث ${r.refreshCount}×)` : ""}`;
       d.querySelector("small").textContent =
-        `${new Date(r.at).toLocaleString("ar")} — 📚 ${r.kbHits} معرفة، 🌐 ${r.webSources} ويب، 🧠 ${r.lessons} دروس`;
-      d.onclick = () => openSheet(`
-        <h2>🔬 ${escapeHtml(r.query)}</h2>
-        <p class="muted">${new Date(r.at).toLocaleString("ar")}</p>
-        <p style="white-space:pre-wrap">${escapeHtml(r.summary || "")}</p>`);
+        `${new Date(r.updatedAt || r.at).toLocaleString("ar")} — 📚 ${r.kbHits} معرفة، 🌐 ${r.webSources} ويب، 🧠 ${r.lessons} دروس`;
+      d.onclick = () => openResearchSheet(id, r);
       box.appendChild(d);
     }
   } catch { box.innerHTML = '<p class="muted">تعذّر التحميل</p>'; }
+}
+
+/* Research detail sheet with live sources + refresh */
+function openResearchSheet(agentId, r) {
+  const srcList = (r.sources || []).map((s) =>
+    `<a href="${escapeHtml(s.url)}" target="_blank" rel="noopener" class="rm-chip">🔗 ${escapeHtml((s.title || s.url).slice(0, 40))}</a>`
+  ).join("");
+  openSheet(`
+    <h2>🔬 ${escapeHtml(r.query)}</h2>
+    <p class="muted">${new Date(r.updatedAt || r.at).toLocaleString("ar")}${r.refreshCount ? ` — 🔄 محدّث ${r.refreshCount} مرات` : ""}</p>
+    <p style="white-space:pre-wrap;line-height:1.9">${escapeHtml(r.summary || "")}</p>
+    ${srcList ? `<h3>🌐 المصادر الحية (${r.sources.length})</h3><div class="rm-chips">${srcList}</div>` : ""}
+    <div class="row" style="margin-top:12px">
+      <button class="btn primary" id="btn-rs-refresh">🔄 تحديث البحث</button>
+    </div>
+    <p class="muted" id="rs-refresh-status" style="font-size:13px"></p>`);
+  $("btn-rs-refresh").onclick = async () => {
+    const st = $("rs-refresh-status");
+    st.textContent = "جارٍ إعادة البحث الحي من المصادر… ⏳";
+    $("btn-rs-refresh").disabled = true;
+    try {
+      const res = await api("/api/research/refresh", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ agentId, query: r.query, depth: r.depth || "deep", refreshId: r.id }),
+      });
+      st.textContent = `✅ تم التحديث — ${res.rec.webSources} مصادر حية، ${res.rec.lessons} دروس جديدة محفوظة في العقل 🧠`;
+      toast("تم تحديث البحث وحفظ الدروس الجديدة 🧠");
+      loadResearchHistory();
+      loadTicker();
+    } catch (e) {
+      st.textContent = "تعذّر التحديث: " + errText(e);
+      $("btn-rs-refresh").disabled = false;
+    }
+  };
 }
 
 /* Live activity ticker */
