@@ -146,45 +146,109 @@ export const BUILTIN_TOOLS = [
   },
   {
     name: "web_search",
-    label: "بحث الويب",
+    label: "بحث الويب الحي",
     icon: "🔍",
-    description: "يبحث في الويب عن معلومات حديثة (أسعار، أخبار، وقائع). الوسائط: {query} مثال: {query: \"سعر الذهب اليوم\"}",
+    description: "يبحث في الويب الحي عن معلومات حديثة (أسعار، أخبار، وقائع) عبر مصادر متعددة. الوسائط: {query} مثال: {query: \"سعر الذهب اليوم\"}",
     async run(args, ctx) {
       const q = String(args.query || "").trim().slice(0, 200);
       if (!q) throw new Error("query مطلوب");
-      // Primary: DuckDuckGo HTML
-      try {
-        const url = "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(q);
-        const res = await ctx.fetch(url, {
-          headers: { "user-agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36" },
-        });
-        if (res.ok) {
-          const html = await res.text();
-          const results = [];
+      const F = ctx.fetch;
+      const UA = "AI-Agent-Studio/2.0";
+      const withTimeout = (ms) => ({ headers: { "user-agent": UA }, signal: AbortSignal.timeout(ms) });
+      const clean = (s) => String(s || "").replace(/<[^>]+>/g, "").replace(/&[^;]+;/g, " ").trim().slice(0, 220);
+
+      // Source 1: Brave Search API (optional upgrade — set BRAVE_API_KEY)
+      async function brave() {
+        const key = ctx.env?.BRAVE_API_KEY;
+        if (!key) return [];
+        const r = await F("https://api.search.brave.com/res/v1/web/search?q=" + encodeURIComponent(q) + "&count=8",
+          { headers: { "X-Subscription-Token": key, "user-agent": UA }, signal: AbortSignal.timeout(9000) });
+        if (!r.ok) return [];
+        const d = await r.json().catch(() => ({}));
+        return (d?.web?.results || []).slice(0, 8).map((x) => ({
+          title: String(x.title || "").slice(0, 140), url: x.url,
+          snippet: clean(x.description), source: "brave",
+        }));
+      }
+      // Source 2: Wikipedia (ar + en) — reliable encyclopedic coverage
+      async function wiki(lang) {
+        const r = await F(`https://${lang}.wikipedia.org/w/api.php?action=query&list=search&srsearch=` +
+          encodeURIComponent(q) + "&format=json&srlimit=5&origin=*", withTimeout(8000));
+        if (!r.ok) return [];
+        const d = await r.json().catch(() => ({}));
+        return (d?.query?.search || []).map((s) => ({
+          title: s.title,
+          url: `https://${lang}.wikipedia.org/wiki/` + encodeURIComponent(String(s.title).replace(/ /g, "_")),
+          snippet: clean(s.snippet), source: "wikipedia-" + lang,
+        }));
+      }
+      // Source 3: Hacker News (Algolia) — tech & startup pulse
+      async function hn() {
+        const r = await F("https://hn.algolia.com/api/v1/search?query=" + encodeURIComponent(q) + "&hitsPerPage=5&tags=story", withTimeout(8000));
+        if (!r.ok) return [];
+        const d = await r.json().catch(() => ({}));
+        return (d?.hits || []).filter((h) => h.title).map((h) => ({
+          title: String(h.title).slice(0, 140),
+          url: h.url || `https://news.ycombinator.com/item?id=${h.objectID}`,
+          snippet: clean(`${h.points || 0} نقطة — ${h.num_comments || 0} تعليق`),
+          source: "hackernews",
+        }));
+      }
+      // Source 4: StackExchange — programming Q&A
+      async function se() {
+        const r = await F("https://api.stackexchange.com/2.3/search/advanced?order=desc&sort=relevance&q=" +
+          encodeURIComponent(q) + "&site=stackoverflow&pagesize=5&filter=!nNPvSNdWme", withTimeout(8000));
+        if (!r.ok) return [];
+        const d = await r.json().catch(() => ({}));
+        return (d?.items || []).map((it) => ({
+          title: clean(it.title).slice(0, 140),
+          url: it.link,
+          snippet: clean(`إجابات: ${it.answer_count ?? "?"} — ${it.is_answered ? "محلول ✅" : "مفتوح"}`),
+          source: "stackoverflow",
+        }));
+      }
+      // Source 5: DuckDuckGo HTML — best effort (often bot-blocked from cloud IPs)
+      async function ddg() {
+        try {
+          const r = await F("https://html.duckduckgo.com/html/?q=" + encodeURIComponent(q), {
+            headers: { "user-agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36" },
+            signal: AbortSignal.timeout(9000),
+          });
+          if (!r.ok) return [];
+          const html = await r.text();
+          const out = [];
           const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
           let m;
-          while ((m = re.exec(html)) && results.length < 5) {
-            const title = m[2].replace(/<[^>]+>/g, "").replace(/&[^;]+;/g, " ").trim().slice(0, 140);
+          while ((m = re.exec(html)) && out.length < 6) {
             let href = m[1];
             const ud = href.match(/[?&]uddg=([^&]+)/);
             if (ud) { try { href = decodeURIComponent(ud[1]); } catch { /* keep */ } }
-            if (title && /^https?:\/\//i.test(href)) results.push({ title, url: href });
+            if (/^https?:\/\//i.test(href)) {
+              out.push({ title: clean(m[2]).slice(0, 140), url: href, snippet: "", source: "duckduckgo" });
+            }
           }
-          if (results.length) return { query: q, source: "duckduckgo", results };
+          return out;
+        } catch { return []; }
+      }
+
+      // Fan out in parallel; every source is optional
+      const settled = await Promise.allSettled([brave(), wiki("ar"), wiki("en"), hn(), se(), ddg()]);
+      const seen = new Set();
+      const results = [];
+      for (const s of settled) {
+        if (s.status !== "fulfilled") continue;
+        for (const r of s.value) {
+          if (!r.url) continue;
+          const key = String(r.url).split("?")[0].toLowerCase().replace(/\/$/, "");
+          if (seen.has(key) || !r.title) continue;
+          seen.add(key);
+          results.push(r);
+          if (results.length >= 10) break;
         }
-      } catch { /* fall through to Wikipedia */ }
-      // Fallback: Wikipedia (reliable, no key)
-      const wurl = "https://ar.wikipedia.org/w/api.php?action=query&list=search&srsearch=" +
-        encodeURIComponent(q) + "&format=json&srlimit=5&origin=*";
-      const wres = await ctx.fetch(wurl, { headers: { "user-agent": "AI-Agent-Studio/1.0" } });
-      if (!wres.ok) throw new Error("تعذّر البحث في الويب حالياً — أجب من معرفتك");
-      const data = await wres.json().catch(() => ({}));
-      const results = (data?.query?.search || []).map((s) => ({
-        title: s.title,
-        url: "https://ar.wikipedia.org/wiki/" + encodeURIComponent(String(s.title).replace(/ /g, "_")),
-        snippet: String(s.snippet || "").replace(/<[^>]+>/g, "").slice(0, 220),
-      }));
-      return { query: q, source: "wikipedia", results };
+        if (results.length >= 10) break;
+      }
+      const engines = [...new Set(results.map((r) => r.source))];
+      return { query: q, results, engines, count: results.length };
     },
   },
   {
