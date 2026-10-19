@@ -13,10 +13,10 @@ import {
 } from "./models.js";
 import { chunkText, retrieve, relevantChunks, RELEVANCE_THRESHOLD } from "./rag.js";
 import { BUILTIN_TOOLS, getBuiltinTool, builtinToolCards } from "./tools.js";
-import { learnFromConversation } from "./learn.js";
+import { learnFromConversation, memoryValue } from "./learn.js";
 import {
   newAgentId, defaultAgent, listAgents, getAgent, saveAgent,
-  deleteAgent, quickCustomize,
+  deleteAgent, quickCustomize, ensureOctopus, OCTOPUS_SYSTEM,
 } from "./agents.js";
 
 const textEncoder = new TextEncoder();
@@ -108,7 +108,7 @@ async function handleConfig() {
 /* ---------------- agents ---------------- */
 
 async function handleAgents(req, kvH, url) {
-  if (req.method === "GET") return json({ agents: await listAgents(kvH) });
+  if (req.method === "GET") return json({ agents: await ensureOctopus(kvH) });
   if (req.method === "POST") {
     const body = await req.json().catch(() => ({}));
     const agent = defaultAgent({
@@ -131,6 +131,7 @@ async function handleAgents(req, kvH, url) {
       expertise: String(body.expertise || "").slice(0, 1000),
       style: String(body.style || "").slice(0, 1000),
       avoidTopics: String(body.avoidTopics || "").slice(0, 1000),
+      isOctopus: !!body.isOctopus,
     });
     await saveAgent(kvH, agent);
     await bumpStat(kvH, "agentsCreated");
@@ -171,6 +172,7 @@ async function handleAgentById(req, kvH, id) {
       if (typeof body[f] === "string") agent[f] = body[f].slice(0, 1000);
     }
     if (typeof body.isActive === "boolean") agent.isActive = body.isActive;
+    if (typeof body.isOctopus === "boolean") agent.isOctopus = body.isOctopus;
     await saveAgent(kvH, agent);
     return json({ agent });
   }
@@ -352,11 +354,22 @@ async function runQualityRating(env, modelId, userText, answer) {
 }
 
 function buildSystemPrompt(agent, memories, learned, ragContext, skills) {
-  const parts = [agent.systemPrompt];
+  const parts = [];
+  // 🐙 Octopus operator persona always leads for the octopus agent
+  if (agent.isOctopus) parts.push(OCTOPUS_SYSTEM);
+  parts.push(agent.systemPrompt);
   const memEntries = Object.entries(memories || {});
   if (memEntries.length) {
-    parts.push("ما تعرفه عن المستخدم (ذاكرة دائمة):\n" +
-      memEntries.map(([k, v]) => `- ${k}: ${v}`).join("\n"));
+    // Expert-level organization: group memories by category
+    const groups = {};
+    for (const [k, v] of memEntries) {
+      const { value, category } = memoryValue(v);
+      (groups[category] = groups[category] || []).push(`- ${k}: ${value}`);
+    }
+    const order = ["شخصي", "عمل", "تفضيلات", "مشاريع", "أخرى"];
+    const blocks = order.filter((c) => groups[c]).map((c) => `[${c}]\n${groups[c].join("\n")}`);
+    for (const c of Object.keys(groups)) if (!order.includes(c)) blocks.push(`[${c}]\n${groups[c].join("\n")}`);
+    parts.push("ما تعرفه عن المستخدم (ذاكرة دائمة مصنّفة):\n" + blocks.join("\n"));
   }
   if (learned && learned.length) {
     parts.push("دروس تعلمتها بنفسك من محادثات سابقة (اتبعها):\n" +
@@ -414,13 +427,17 @@ const RESEARCH_SYSTEM = `أنت باحث محلل محترف. أمامك موض�
 (اذكر: قاعدة المعرفة الداخلية / الويب — بعناوينها)
 كن دقيقاً وموضوعياً. إن تعارضت المصادر اذكر التعارض. لا تخترع معلومات.`;
 
-async function runDeepResearch(env, kvH, agent, query, send) {
+async function runDeepResearch(env, kvH, agent, query, send, depth = "deep") {
   const startedAt = new Date().toISOString();
   const kbHits = [];
   const webSources = [];
+  const seenUrls = new Set();
   let neurons = 0;
+  const comprehensive = depth === "comprehensive";
+  const maxSources = comprehensive ? 6 : 4;
+  const fetchChars = comprehensive ? 4000 : 3000;
 
-  send({ type: "research", stage: "start", query });
+  send({ type: "research", stage: "start", query, depth });
 
   // Stage 1: internal knowledge base first
   send({ type: "research", stage: "kb", state: "start" });
@@ -439,17 +456,38 @@ async function runDeepResearch(env, kvH, agent, query, send) {
   if (needWeb) {
     send({ type: "research", stage: "web", state: "start" });
     try {
+      // Query fan-out: 3 search phrasings for broader coverage
+      let queries = [query];
+      try {
+        const { result: qr } = await runChatLLM(env, agent.model, [
+          { role: "system", content: `ولّد 3 صيغ بحث مختلفة لنفس الموضوع (عربية أولاً). أعد JSON فقط: {"queries":["...","...","..."]}` },
+          { role: "user", content: `الموضوع: ${query}` },
+        ], 200);
+        const m = String(qr?.response || "").match(/\{[\s\S]*\}/);
+        if (m) {
+          const arr = JSON.parse(m[0]).queries || [];
+          const qs = arr.map(String).map((s) => s.trim()).filter((s) => s.length > 2).slice(0, 3);
+          if (qs.length) queries = [...new Set([query, ...qs])].slice(0, 3);
+        }
+        neurons += chatNeurons(agent.model, 100, 150);
+      } catch { /* fan-out is best-effort */ }
       const wsTool = getBuiltinTool("web_search");
-      const out = await wsTool.run({ query }, { fetch, agent, env });
-      const results = (out.results || []).slice(0, 4);
       const fetchTool = getBuiltinTool("url_fetch");
-      for (const r of results) {
-        send({ type: "research", stage: "fetch", state: "progress", title: r.title });
-        try {
-          const page = await fetchTool.run({ url: r.url, maxChars: 3000 }, { fetch, agent, env });
-          const text = String(page.text || page.content || "").slice(0, 3000);
-          if (text.length > 200) webSources.push({ title: r.title, url: r.url, text });
-        } catch { /* skip failed source */ }
+      for (const q of queries) {
+        if (webSources.length >= maxSources) break;
+        const out = await wsTool.run({ query: q }, { fetch, agent, env });
+        for (const r of (out.results || [])) {
+          if (webSources.length >= maxSources) break;
+          const urlKey = String(r.url || "").split("?")[0].toLowerCase();
+          if (!r.url || seenUrls.has(urlKey)) continue; // dedupe by URL
+          seenUrls.add(urlKey);
+          send({ type: "research", stage: "fetch", state: "progress", title: r.title });
+          try {
+            const page = await fetchTool.run({ url: r.url, maxChars: fetchChars }, { fetch, agent, env });
+            const text = String(page.text || page.content || "").slice(0, fetchChars);
+            if (text.length > 200) webSources.push({ title: r.title, url: r.url, text });
+          } catch { /* skip failed source */ }
+        }
       }
     } catch { /* web failed — continue with KB only */ }
     send({
@@ -614,11 +652,13 @@ async function handleChat(req, env, kvH, waitCtx) {
   }
   const userText = String(body.message || "").trim().slice(0, 4000);
   if (!userText) return json({ code: "bad", message: "الرسالة فارغة" }, 400);
-  // Deep-research trigger: "ابحث بعمق عن ..." / "بحث معمق: ..."
+  // Deep-research trigger: "ابحث بعمق عن ..." / "بحث معمق: ..." / "بحث شامل عن ..."
   let researchQuery = "";
-  const rm = userText.match(/^(ابحث بعمق عن|بحث معمق عن|بحث معمق:|deep research:?)\s*([\s\S]+)/i);
+  let researchDepth = "deep";
+  const rm = userText.match(/^(ابحث بعمق عن|بحث معمق عن|بحث معمق:|بحث شامل عن|بحث شامل:|deep research:?|comprehensive research:?)\s*([\s\S]+)/i);
   if (rm && rm[2].trim()) {
     researchQuery = rm[2].trim().slice(0, 500);
+    if (/شامل|comprehensive/i.test(rm[1])) researchDepth = "comprehensive";
   } else if (/ابحث بعمق/i.test(userText)) {
     const q = userText.replace(/ابحث بعمق( عن)?/gi, "").replace(/[:،,]/g, " ").trim();
     if (q.length > 2) researchQuery = q.slice(0, 500);
@@ -662,7 +702,7 @@ async function handleChat(req, env, kvH, waitCtx) {
 
         if (researchQuery) {
           // Deep-research mode: KB -> web -> analyze -> learn, with live map
-          const { report } = await runDeepResearch(env, kvH, agent, researchQuery, send);
+          const { report } = await runDeepResearch(env, kvH, agent, researchQuery, send, researchDepth);
           full = report;
           for (let i = 0; i < full.length; i += 48) {
             send({ type: "token", text: full.slice(i, i + 48) });
@@ -1013,6 +1053,72 @@ async function handleSkills(req, kvH) {
   return json({ code: "method", message: "Method not allowed" }, 405);
 }
 
+/* ---------------- mind summary (expert organizer) ---------------- */
+
+function hashStr(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
+/**
+ * GET /api/mind/:agentId — "who am I according to what you know about me":
+ * an auto-generated profile summary from categorized memories + lessons,
+ * cached and regenerated only when the underlying data changes.
+ */
+async function handleMindSummary(env, kvH, agentId) {
+  const agent = await getAgent(kvH, String(agentId || ""));
+  if (!agent) return json({ code: "not-found", message: "الوكيل غير موجود" }, 404);
+  const memories = (await kvH.get(`mem:${agent.id}`)) || {};
+  const learned = (await kvH.get(`learned:${agent.id}`)) || [];
+  const memLines = Object.entries(memories).map(([k, v]) => {
+    const mv = memoryValue(v);
+    return `${k} [${mv.category}]: ${mv.value}`;
+  });
+  const lessonLines = learned.slice(-15).map((l) => l.text);
+  const fingerprint = `${memLines.length}:${learned.length}:${hashStr(memLines.join("|") + lessonLines.join("|"))}`;
+  const cacheKey = `mindsum:${agent.id}`;
+  const cached = await kvH.get(cacheKey);
+  if (cached && cached.fingerprint === fingerprint) return json({ ...cached, cached: true });
+
+  const counts = {};
+  for (const [, v] of Object.entries(memories)) {
+    const c = memoryValue(v).category;
+    counts[c] = (counts[c] || 0) + 1;
+  }
+
+  let summary;
+  if (!memLines.length && !lessonLines.length) {
+    summary = "لا توجد ذكريات محفوظة بعد — تحدث معي وسأبني خريطة معرفية منظمة عنك: شخصي، عمل، تفضيلات، مشاريع.";
+  } else {
+    try {
+      const { result } = await runChatLLM(env, agent.model, [
+        {
+          role: "system",
+          content: "أنت خبير تنظيم معلومات. أمامك ذكريات مصنّفة ودروس مستخلصة عن مستخدم. اكتب ملخصاً شخصياً منظماً بعنوان «من أنت حسب ما أعرفه عنك»: فقرات قصيرة حسب الفئات (شخصي/عمل/تفضيلات/مشاريع) ثم سطر عن أسلوب التعلم المفضل. بالعربية، مباشر، بلا حشو.",
+        },
+        {
+          role: "user",
+          content: `الذكريات:\n${memLines.join("\n") || "(لا شيء)"}\n\nالدروس:\n${lessonLines.join("\n") || "(لا شيء)"}`,
+        },
+      ], 600);
+      summary = String(result?.response || "").trim() || "تعذّر توليد الملخص.";
+    } catch {
+      summary = "تعذّر توليد الملخص حالياً — حاول لاحقاً.";
+    }
+  }
+  const out = {
+    summary,
+    generatedAt: new Date().toISOString(),
+    counts,
+    memories: memLines.length,
+    lessons: learned.length,
+    fingerprint,
+  };
+  await kvH.set(cacheKey, out);
+  return json({ ...out, cached: false });
+}
+
 /* ---------------- brain (live knowledge graph) ---------------- */
 
 async function handleBrain(kvH, agentId) {
@@ -1020,18 +1126,20 @@ async function handleBrain(kvH, agentId) {
   if (!agent) return json({ code: "not-found", message: "الوكيل غير موجود" }, 404);
   const nodes = [];
   const edges = [];
-  const add = (id, label, kind, icon, detail) => nodes.push({
+  const add = (id, label, kind, icon, detail, cat) => nodes.push({
     id, label: String(label || "").slice(0, 60), kind,
     icon: String(icon || "•").slice(0, 8), detail: String(detail || "").slice(0, 400),
+    ...(cat ? { cat: String(cat).slice(0, 20) } : {}),
   });
   const link = (a, b) => edges.push([a, b]);
   const A = "agent";
   add(A, agent.name, "agent", agent.avatar || "🤖", agent.description || agent.tone || "");
   let i = 0;
   const memories = (await kvH.get(`mem:${agent.id}`)) || {};
-  for (const [k, v] of Object.entries(memories).slice(0, 25)) {
+  for (const [k, v] of Object.entries(memories).slice(0, 30)) {
     const id = `mem${i++}`;
-    add(id, k, "memory", "🧠", `${k}: ${v}`);
+    const mv = memoryValue(v);
+    add(id, k, "memory", "🧠", `${k}: ${mv.value}`, mv.category);
     link(A, id);
   }
   const learned = (await kvH.get(`learned:${agent.id}`)) || [];
@@ -1426,6 +1534,7 @@ export default {
           for (const e of log.slice(-6)) {
             items.push({
               at: e.at, icon: icons[e.event] || "•",
+              agentId: a.id,
               agent: `${a.avatar || "🤖"} ${a.name}`,
               text: String(e.detail || "").slice(0, 140),
             });
@@ -1449,19 +1558,32 @@ export default {
         return json({ research: list });
       }
 
-      // Training suggestions: recent knowledge gaps across agents
+      // Training suggestions: knowledge gaps aggregated & prioritized by frequency
       if (path === "/api/gaps" && request.method === "GET") {
         const agents = await listAgents(kvH);
-        const gaps = [];
+        const map = new Map();
         for (const a of agents.slice(0, 20)) {
           const log = (await kvH.get(`learn:${a.id}`)) || [];
           for (const e of log) {
             if (e.event === "gap") {
-              gaps.push({ agentId: a.id, agentName: a.name, avatar: a.avatar, at: e.at, detail: e.detail });
+              const key = String(e.detail || "").slice(0, 200);
+              if (!key) continue;
+              let rec = map.get(key);
+              if (!rec) {
+                rec = { detail: key, count: 0, agents: [], lastAt: null };
+                map.set(key, rec);
+              }
+              rec.count++;
+              if (!rec.agents.some((x) => x.id === a.id)) {
+                rec.agents.push({ id: a.id, name: a.name, avatar: a.avatar });
+              }
+              if (!rec.lastAt || String(e.at) > String(rec.lastAt)) rec.lastAt = e.at;
             }
           }
         }
-        gaps.sort((x, y) => new Date(y.at) - new Date(x.at));
+        const gaps = [...map.values()].sort(
+          (x, y) => y.count - x.count || String(y.lastAt).localeCompare(String(x.lastAt))
+        );
         return json({ gaps: gaps.slice(0, 10) });
       }
 
@@ -1529,6 +1651,10 @@ export default {
       }
       m = path.match(/^\/api\/brain\/([^/]+)$/);
       if (m && request.method === "GET") return handleBrain(kvH, m[1]);
+
+      // Mind summary: auto-generated "who am I" profile
+      m = path.match(/^\/api\/mind\/([^/]+)$/);
+      if (m && request.method === "GET") return handleMindSummary(env, kvH, m[1]);
       m = path.match(/^\/api\/tools\/([^/]+)$/);
       if (m && request.method === "DELETE") {
         await kvH.del(`tool:${m[1]}`);
