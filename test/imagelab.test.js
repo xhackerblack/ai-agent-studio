@@ -100,6 +100,16 @@ test("analyzeImage throws on empty vision response", async () => {
   await assert.rejects(() => analyzeImage(env, "", "x"), /no image bytes/);
 });
 
+test("analyzeImage adds the strict gate for coloring-page niche", async () => {
+  let seen;
+  const env = { AI: { run: async (model, input) => { seen = input; return { response: VISION_OK }; } } };
+  await analyzeImage(env, "eA==", "a pumpkin", "coloring-page");
+  assert.match(seen.prompt, /STRICT GATE/);
+  assert.match(seen.prompt, /styleMatch MUST be 1/);
+  await analyzeImage(env, "eA==", "a pumpkin", "general");
+  assert.doesNotMatch(seen.prompt, /STRICT GATE/);
+});
+
 /* ---------- evaluateAndLearn (full pipeline) ---------- */
 
 function visionEnv(reply = VISION_OK) {
