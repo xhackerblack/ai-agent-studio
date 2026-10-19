@@ -18,6 +18,15 @@ import {
   evaluateAndLearn, getImageLessons, buildLearnSuffix, EVAL_CRITERIA,
 } from "./imagelab.js";
 import {
+  createSession, verifySession, sessionCookie, clearSessionCookie,
+  loginRateCheck, noteLoginFail, clearLoginFails, authGate, noSecretResponse,
+} from "./auth.js";
+import {
+  DEFAULT_NEURON_CAP, noteNeurons, noteKvWrite, noteError, recentErrors,
+  bumpStatBatched, flushUsage, getUsageState, cheapestChatModel,
+  recordChatNeurons, recordImageNeurons, recordVisionNeurons, getResearchSettings,
+} from "./usage.js";
+import {
   NICHES, getNiche, nicheKeyOf, detectNicheHeuristic, analyzeNiche, refinePrompt,
   buildFinalPrompt, preflightCheck, fixPrompt, extractStyleDNA, styleFromImage,
 } from "./niche.js";
@@ -44,11 +53,23 @@ function kv(env) {
       const v = await ns.get(k);
       return v ? JSON.parse(v) : null;
     },
+    // Resilient writes: a KV put failure (e.g. daily write limit) is logged
+    // and the request continues instead of crashing. Counters stay approximate.
     async set(k, v) {
-      await ns.put(k, JSON.stringify(v));
+      noteKvWrite();
+      try {
+        await ns.put(k, JSON.stringify(v));
+      } catch (e) {
+        noteError("kv.put", e);
+      }
     },
     async del(k) {
-      await ns.delete(k);
+      noteKvWrite();
+      try {
+        await ns.delete(k);
+      } catch (e) {
+        noteError("kv.del", e);
+      }
     },
   };
 }
@@ -67,6 +88,85 @@ async function checkPassword(request, env) {
   return timingSafeEqual(textEncoder.encode(given), textEncoder.encode(secret));
 }
 
+/* ---------------- auth endpoints ---------------- */
+
+async function handleLogin(request, env) {
+  const secret = env.APP_PASSWORD;
+  if (!secret) return json(noSecretResponse(), 503);
+  const rl = await loginRateCheck(request);
+  if (rl.limited) {
+    return json({ code: "rate-limited", message: "محاولات كثيرة فاشلة — انتظر 15 دقيقة ثم حاول مجددًا" }, 429);
+  }
+  const body = await request.json().catch(() => ({}));
+  const given = String(body.password || "");
+  if (!given || !timingSafeEqual(textEncoder.encode(given), textEncoder.encode(secret))) {
+    await noteLoginFail(request);
+    return json({ code: "unauthorized", message: "كلمة المرور غير صحيحة" }, 401);
+  }
+  await clearLoginFails(request);
+  const token = await createSession(secret);
+  const secure = new URL(request.url).protocol === "https:";
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "Set-Cookie": sessionCookie(token, secure),
+    },
+  });
+}
+
+async function handleLogout(request) {
+  const secure = new URL(request.url).protocol === "https:";
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "Set-Cookie": clearSessionCookie(secure),
+    },
+  });
+}
+
+async function handleSession(request, env) {
+  const secret = env.APP_PASSWORD;
+  if (!secret) return json(noSecretResponse(), 503);
+  const ok = await verifySession(secret, request.headers.get("cookie"));
+  return ok ? json({ ok: true }) : json({ code: "unauthorized", message: "غير مسجّل الدخول" }, 401);
+}
+
+/* ---------------- settings + usage endpoints ---------------- */
+
+async function handleGetSettings(kvH) {
+  const usage = (await kvH.get("settings:usage").catch(() => null)) || {};
+  const research = await getResearchSettings(kvH);
+  return json({
+    usageCap: Number(usage.cap) > 0 ? Number(usage.cap) : DEFAULT_NEURON_CAP,
+    defaultCap: DEFAULT_NEURON_CAP,
+    researchEnabled: research.enabled,
+    researchEveryH: research.everyH,
+  });
+}
+
+async function handlePostSettings(request, kvH) {
+  const body = await request.json().catch(() => ({}));
+  if (body.usageCap !== undefined) {
+    const cap = Math.max(1000, Math.min(100000, Number(body.usageCap) || DEFAULT_NEURON_CAP));
+    await kvH.set("settings:usage", { cap });
+  }
+  if (body.researchEnabled !== undefined || body.researchEveryH !== undefined) {
+    const cur = await getResearchSettings(kvH);
+    await kvH.set("settings:research", {
+      enabled: body.researchEnabled !== undefined ? !!body.researchEnabled : cur.enabled,
+      everyH: [3, 6, 12, 24].includes(Number(body.researchEveryH)) ? Number(body.researchEveryH) : cur.everyH,
+    });
+  }
+  return handleGetSettings(kvH);
+}
+
+async function handleUsage(kvH) {
+  const state = await getUsageState(kvH);
+  return json({ ...state, errors: recentErrors().slice(0, 5) });
+}
+
 function errDetail(err) {
   return String((err && (err.message || err.error)) || err || "unknown").slice(0, 300);
 }
@@ -77,10 +177,10 @@ function isQuotaError(err) {
 }
 
 async function bumpStat(kvH, key, by = 1) {
-  const day = new Date().toISOString().slice(0, 10);
-  const k = `stats:${day}:${key}`;
-  const v = (await kvH.get(k)) || 0;
-  await kvH.set(k, v + by);
+  // Batched: aggregated in memory, flushed to KV periodically (approximate).
+  // Neuron accounting also feeds the quota guard.
+  if (key === "neurons") noteNeurons(by);
+  bumpStatBatched(key, by);
 }
 
 async function runChatLLM(env, modelId, messages, maxTokens, stream = false) {
@@ -100,7 +200,7 @@ async function runChatLLM(env, modelId, messages, maxTokens, stream = false) {
 
 /* ---------------- config ---------------- */
 
-async function handleConfig() {
+async function handleConfig(env) {
   return json({
     models: publicModels(),
     defaultModel: DEFAULT_CHAT_MODEL,
@@ -109,6 +209,7 @@ async function handleConfig() {
     freePerDay: FREE_NEURONS_PER_DAY,
     builtinTools: builtinToolCards(),
     app: "AI Agent Studio",
+    auth: { required: true, configured: !!env.APP_PASSWORD },
   });
 }
 
@@ -252,6 +353,7 @@ async function generateImage(env, prompt, modelId) {
     b64 = btoa(bin);
   }
   if (!bytes.length) throw new Error("empty image");
+  recordImageNeurons(model.id);
   const id = crypto.randomUUID();
   await env.STUDIO_KV.put(`img:${id}`, bytes, {
     metadata: { prompt: clean.slice(0, 200), at: Date.now() },
@@ -515,6 +617,17 @@ async function handleGenerateImage(request, env, kvH) {
   if (body.agentId) {
     try { agent = await getAgent(kvH, String(body.agentId)); } catch { /* optional */ }
   }
+  // Quota guard: image generation is expensive — block it at 100% with a
+  // clear message instead of burning the daily estimate.
+  try {
+    const ustate = await getUsageState(kvH);
+    if (ustate.downgraded) {
+      return json({
+        code: "quota",
+        message: `وصل الاستهلاك التقديري إلى ${ustate.pct}% من السقف اليومي (${ustate.used}/${ustate.cap}) — توليد الصور متوقف حتى الغد، أو ارفع السقف من الإعدادات.`,
+      }, 429);
+    }
+  } catch { /* guard is best-effort */ }
   try {
     const r = await generateImageSmart(env, kvH, agent, prompt, body.model, {
       preAnalyzed: body.niche ? { niche: body.niche, subject: body.subject, refined: body.refined } : null,
@@ -943,6 +1056,16 @@ async function handleChat(req, env, kvH, waitCtx) {
   }
   const userText = String(body.message || "").trim().slice(0, 4000);
   if (!userText) return json({ code: "bad", message: "الرسالة فارغة" }, 400);
+  // Quota guard: at 100% of the daily neuron estimate, force the cheapest
+  // chat model and warn once in the stream (never silently burn quota).
+  let quotaNotice = "";
+  try {
+    const ustate = await getUsageState(kvH);
+    if (ustate.downgraded) {
+      agent.model = cheapestChatModel();
+      quotaNotice = `⚠️ وصل الاستهلاك التقديري إلى ${ustate.pct}% من السقف اليومي (${ustate.used}/${ustate.cap}) — أستخدم الآن أرخص نموذج.`;
+    }
+  } catch { /* guard is best-effort; chat must not break */ }
   // Deep-research trigger: "ابحث بعمق عن ..." / "بحث معمق: ..." / "بحث شامل عن ..."
   let researchQuery = "";
   let researchDepth = "deep";
@@ -971,6 +1094,7 @@ async function handleChat(req, env, kvH, waitCtx) {
       const toolsUsed = [];
       try {
         send({ type: "conversation", id: conv.id, title: conv.title });
+        if (quotaNotice) send({ type: "notice", text: quotaNotice });
 
         const [memories, learned, skills] = await Promise.all([
           kvH.get(`mem:${agent.id}`),
@@ -1132,10 +1256,13 @@ async function handleChat(req, env, kvH, waitCtx) {
         send({ type: "done", tools: toolsUsed, images: imageIds });
         controller.close();
 
-        // Background: self-learning autopilot + quality self-rating (never block the reply)
+        // Background: self-learning autopilot + quality self-rating (never block the reply).
+        // Paused automatically when the daily neuron estimate passes 70%.
         if (waitCtx && typeof waitCtx.waitUntil === "function") {
           waitCtx.waitUntil((async () => {
             try {
+              const ustate = await getUsageState(kvH).catch(() => null);
+              if (ustate && ustate.bgStopped) return; // quota guard: background work paused
               if (agent.autoLearn) {
                 const r = await learnFromConversation(env, kvH, agent, conv.messages);
                 if (!r.skipped) {
@@ -1756,17 +1883,26 @@ export default {
       return env.ASSETS.fetch(request);
     }
 
-    // Password gate (optional).
-    // /api/images/* uses unguessable UUID URLs and must load inside <img>
-    // tags (which can't send the x-app-password header), so it is exempt.
-    const isPublicImage = path.startsWith("/api/images/");
-    if (path !== "/api/config" && !isPublicImage && !(await checkPassword(request, env))) {
-      return json({ code: "unauthorized", message: "كلمة المرور غير صحيحة" }, 401);
+    // Mandatory password gate (auth.js): APP_PASSWORD must be set, then a
+    // signed HttpOnly session cookie (or INTERNAL_TOKEN for internal tasks).
+    const gate = await authGate(request, env);
+    if (gate.status === "no-secret") return json(noSecretResponse(), 503);
+    if (gate.status === "unauthorized") {
+      return json({ code: "unauthorized", message: "سجّل الدخول أولاً" }, 401);
     }
 
     const kvH = kv(env);
+    // Flush batched counters/stats from previous requests (cheap no-op unless due).
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(flushUsage(kvH));
+    else await flushUsage(kvH);
     try {
-      if (path === "/api/config" && request.method === "GET") return handleConfig();
+      if (path === "/api/config" && request.method === "GET") return handleConfig(env);
+      if (path === "/api/login" && request.method === "POST") return handleLogin(request, env);
+      if (path === "/api/logout") return handleLogout(request);
+      if (path === "/api/session" && request.method === "GET") return handleSession(request, env);
+      if (path === "/api/usage" && request.method === "GET") return handleUsage(kvH);
+      if (path === "/api/settings" && request.method === "GET") return handleGetSettings(kvH);
+      if (path === "/api/settings" && request.method === "POST") return handlePostSettings(request, kvH);
 
       let mImg = path.match(/^\/api\/images\/([A-Za-z0-9-]+)$/);
       if (mImg && request.method === "GET") return handleImage(env, mImg[1]);
@@ -2056,6 +2192,27 @@ export default {
 
   // Cron trigger: autonomous research every 30 minutes
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(autoResearchCycle(env));
+    ctx.waitUntil((async () => {
+      try {
+        const kvH = kv(env);
+        const rs = await getResearchSettings(kvH);
+        if (!rs.enabled) return; // user disabled the autonomous researcher
+        const last = (await kvH.get("research:lastRun").catch(() => null)) || 0;
+        if (Date.now() - last < rs.everyH * 3600e3) return; // respect the chosen interval
+        const ustate = await getUsageState(kvH).catch(() => null);
+        if (ustate && ustate.bgStopped) return; // quota guard: paused at 70%
+        await kvH.set("research:lastRun", Date.now());
+        await autoResearchCycle(env);
+      } catch (e) {
+        noteError("scheduled", e);
+      } finally {
+        try { await flushUsage(kv(env)); } catch { /* best-effort */ }
+      }
+    })());
   },
 };
+
+/** Test hook: force-flush batched counters (tests only). */
+export function __forceFlush(env) {
+  return flushUsage(kv(env), true);
+}
