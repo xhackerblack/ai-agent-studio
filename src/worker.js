@@ -15,6 +15,9 @@ import { chunkText, retrieve, relevantChunks, RELEVANCE_THRESHOLD } from "./rag.
 import { BUILTIN_TOOLS, getBuiltinTool, builtinToolCards } from "./tools.js";
 import { learnFromConversation, memoryValue } from "./learn.js";
 import {
+  evaluateAndLearn, getImageLessons, buildLearnSuffix, EVAL_CRITERIA,
+} from "./imagelab.js";
+import {
   newAgentId, defaultAgent, listAgents, getAgent, saveAgent,
   deleteAgent, quickCustomize, ensureOctopus, OCTOPUS_SYSTEM,
 } from "./agents.js";
@@ -162,6 +165,7 @@ async function handleAgentById(req, kvH, id) {
       agent.skillIds = body.skillIds.map(String).slice(0, 12);
     }
     if (typeof body.autoLearn === "boolean") agent.autoLearn = body.autoLearn;
+    if (typeof body.imageLearn === "boolean") agent.imageLearn = body.imageLearn;
     if (typeof body.autoResearch === "boolean") agent.autoResearch = body.autoResearch;
     if (Array.isArray(body.researchTopics)) {
       agent.researchTopics = body.researchTopics.map((t) => String(t).slice(0, 200)).filter(Boolean).slice(0, 10);
@@ -222,21 +226,26 @@ async function handleConversations(req, kvH, url) {
 /**
  * Generate an image with Workers AI, store the PNG bytes in KV,
  * return an unguessable URL. Images expire after 30 days.
+ * Also returns b64 (base64 bytes) for the vision self-critique.
  */
 async function generateImage(env, prompt, modelId) {
   const model = getImageModel(modelId);
   const clean = String(prompt || "").trim().slice(0, 2000);
   if (!clean) throw new Error("الوصف فارغ");
   const out = await env.AI.run(model.id, { prompt: clean, steps: 4 });
-  let bytes;
+  let bytes, b64;
   if (model.returns === "base64") {
-    const b64 = out?.image;
+    b64 = out?.image;
     if (typeof b64 !== "string" || !b64.length) throw new Error("no image in model response");
     const bin = atob(b64);
     bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   } else {
     bytes = new Uint8Array(await new Response(out).arrayBuffer());
+    let bin = "";
+    const CH = 0x8000;
+    for (let i = 0; i < bytes.length; i += CH) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+    b64 = btoa(bin);
   }
   if (!bytes.length) throw new Error("empty image");
   const id = crypto.randomUUID();
@@ -244,17 +253,71 @@ async function generateImage(env, prompt, modelId) {
     metadata: { prompt: clean.slice(0, 200), at: Date.now() },
     expirationTtl: 60 * 60 * 24 * 30,
   });
-  return { id, url: `/api/images/${id}` };
+  return { id, url: `/api/images/${id}`, b64 };
+}
+
+/**
+ * Smart generation: injects lessons learned from the agent's own past image
+ * evaluations into the prompt, then runs the vision self-critique pipeline
+ * (evaluateAndLearn) so every image teaches the next one.
+ */
+async function generateImageSmart(env, kvH, agent, prompt, modelId) {
+  const original = String(prompt || "").trim();
+  let lessons = [];
+  try {
+    lessons = agent ? await getImageLessons(kvH, agent.id, 3) : [];
+  } catch { /* lessons are best-effort */ }
+  const enriched = original + buildLearnSuffix(lessons);
+  const { id, url, b64 } = await generateImage(env, enriched, modelId);
+  let evaluation = { evaluated: false, reason: "pending" };
+  try {
+    evaluation = await evaluateAndLearn(env, kvH, agent, id, original, b64);
+  } catch (e) {
+    evaluation = { evaluated: false, reason: String((e && e.message) || e || "eval-error").slice(0, 120) };
+  }
+  return { id, url, model: getImageModel(modelId).id, evaluation };
+}
+
+/** Re-run the vision self-critique for an image whose analysis failed/missing. */
+async function handleImageEvalRetry(request, env, kvH, imageId) {
+  const body = await request.json().catch(() => ({}));
+  let agent = null;
+  if (body.agentId) {
+    try { agent = await getAgent(kvH, String(body.agentId)); } catch { /* optional */ }
+  }
+  const buf = await env.STUDIO_KV.get(`img:${imageId}`, "arrayBuffer");
+  if (!buf) return json({ code: "not-found", message: "الصورة غير موجودة" }, 404);
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  const CH = 0x8000;
+  for (let i = 0; i < bytes.length; i += CH) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+  const prev = (await kvH.get(`imgeval:${imageId}`)) || {};
+  let prompt = String(prev.prompt || "");
+  if (!prompt && agent) {
+    const log = (await kvH.get(`imglog:${agent.id}`)) || [];
+    const hit = log.find((x) => x.id === imageId);
+    if (hit) prompt = hit.prompt;
+  }
+  try {
+    const evaluation = await evaluateAndLearn(env, kvH, agent, imageId, prompt, btoa(bin));
+    return json({ evaluation });
+  } catch (e) {
+    return json({ code: "upstream", message: "تعذّر تحليل الصورة", detail: errDetail(e) }, 502);
+  }
 }
 
 async function handleGenerateImage(request, env, kvH) {
   const body = await request.json().catch(() => ({}));
   const prompt = String(body.prompt || "").trim();
   if (!prompt) return json({ code: "bad", message: "الوصف (prompt) مطلوب" }, 400);
+  let agent = null;
+  if (body.agentId) {
+    try { agent = await getAgent(kvH, String(body.agentId)); } catch { /* optional */ }
+  }
   try {
-    const { id, url } = await generateImage(env, prompt, body.model);
+    const r = await generateImageSmart(env, kvH, agent, prompt, body.model);
     await bumpStat(kvH, "images");
-    return json({ id, url, model: getImageModel(body.model).id }, 201);
+    return json({ id: r.id, url: r.url, model: r.model, evaluation: r.evaluation }, 201);
   } catch (e) {
     if (isQuotaError(e)) return json({ code: "quota", message: "نفدت الحصة اليومية" }, 429);
     return json({ code: "upstream", message: "تعذّر توليد الصورة", detail: errDetail(e) }, 502);
@@ -744,7 +807,7 @@ async function handleChat(req, env, kvH, waitCtx) {
           const toolCtx = {
             fetch, agent, env,
             getCustomTool: async (id) => kvH.get(`tool:${id}`),
-            generateImage: (prompt, model) => generateImage(env, prompt, model),
+            generateImage: (prompt, model) => generateImageSmart(env, kvH, agent, prompt, model),
             addReminder: async (agentId, item) => {
               const k = `reminders:${agentId}`;
               const list = (await kvH.get(k)) || [];
@@ -1168,10 +1231,12 @@ async function handleBrain(kvH, agentId) {
     link(A, id);
   }
   const learned = (await kvH.get(`learned:${agent.id}`)) || [];
+  const lessonNodeByImage = {};
   for (const l of learned.slice(-20)) {
     const id = `les${i++}`;
     add(id, (l.text || "").slice(0, 42), "lesson", "💡", l.text);
     link(A, id);
+    if (l && l.source === "image-eval" && l.imageId) lessonNodeByImage[l.imageId] = id;
   }
   const files = (await kvH.get(`know:${agent.id}:files`)) || [];
   for (const f of files.slice(0, 10)) {
@@ -1198,11 +1263,29 @@ async function handleBrain(kvH, agentId) {
     link(A, id);
   }
   const log = (await kvH.get(`learn:${agent.id}`)) || [];
-  const evIcon = { memory: "🧠", lesson: "💡", gap: "❓", training: "📄", quality: "⭐", research: "🔬", "auto-research": "🛰️" };
+  const evIcon = { memory: "🧠", lesson: "💡", gap: "❓", training: "📄", quality: "⭐", research: "🔬", "auto-research": "🛰️", "image-eval": "🖼️" };
   for (const e of log.slice(-12)) {
     const id = `ev${i++}`;
     add(id, (e.detail || "").slice(0, 42), "event", evIcon[e.event] || "✨", e.detail);
     link(A, id);
+  }
+  // 🖼️ Image self-learning: generated images + their vision evaluations.
+  // This is where the user SEES the model training on each image.
+  const imglog = (await kvH.get(`imglog:${agent.id}`)) || [];
+  for (const im of imglog.slice(-8)) {
+    const iid = `img${i++}`;
+    const score = im.overall != null ? ` — ⭐ ${im.overall}/5` : " — بانتظار التقييم";
+    add(iid, (im.prompt || "صورة مولدة").slice(0, 40), "image", "🖼️", `صورة مولدة: ${(im.prompt || "").slice(0, 120)}${score}`);
+    link(A, iid);
+    if (lessonNodeByImage[im.id]) link(iid, lessonNodeByImage[im.id]);
+    const ev = await kvH.get(`imgeval:${im.id}`);
+    if (ev && ev.evaluated) {
+      const eid = `evl${i++}`;
+      const topIssue = (ev.issues && ev.issues[0]) || "";
+      add(eid, `⭐ ${ev.overall}/5`, "eval", "⭐",
+        `تقييم ذاتي ${ev.overall}/5${topIssue ? ` — ملاحظة: ${topIssue}` : ""}`);
+      link(iid, eid);
+    }
   }
   const counts = {};
   for (const n of nodes) counts[n.kind] = (counts[n.kind] || 0) + 1;
@@ -1468,6 +1551,23 @@ export default {
 
       if (path === "/api/generate-image" && request.method === "POST") {
         return handleGenerateImage(request, env, kvH);
+      }
+
+      // Image self-learning: history, evaluation detail, retry failed analysis
+      let mHist = path.match(/^\/api\/image-history\/([^/]+)$/);
+      if (mHist && request.method === "GET") {
+        const log = (await kvH.get(`imglog:${mHist[1]}`)) || [];
+        return json({ images: log.slice().reverse() });
+      }
+      let mRetry = path.match(/^\/api\/image-eval\/([A-Za-z0-9-]+)\/retry$/);
+      if (mRetry && request.method === "POST") {
+        return handleImageEvalRetry(request, env, kvH, mRetry[1]);
+      }
+      let mEval = path.match(/^\/api\/image-eval\/([A-Za-z0-9-]+)$/);
+      if (mEval && request.method === "GET") {
+        const ev = await kvH.get(`imgeval:${mEval[1]}`);
+        if (!ev) return json({ code: "not-found", message: "لا يوجد تقييم لهذه الصورة" }, 404);
+        return json({ evaluation: ev, criteria: EVAL_CRITERIA });
       }
 
       if (path === "/api/agents") return handleAgents(request, kvH, url);
