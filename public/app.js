@@ -253,6 +253,12 @@ function openAgentModal(a) {
     <div id="am-skills" class="chips"><span class="muted">جارٍ التحميل…</span></div>
     <p class="muted" style="font-size:13px;margin:0 0 6px">أضف مهارات جديدة من لوحة التحكم ← مكتبة المهارات</p>
     <label class="switch-row"><span>🧠 تعلّم ذاتي تلقائي <small class="muted">— بعد كل محادثة</small></span><button type="button" class="switch" id="am-autolearn" role="switch" aria-label="التعلم الذاتي"></button></label>
+    <label class="switch-row"><span>🛰️ بحث تلقائي مستمر <small class="muted">— من الويب كل ٣٠ دقيقة</small></span><button type="button" class="switch" id="am-autoresearch" role="switch" aria-label="البحث التلقائي"></button></label>
+    <div id="am-topics-row" class="hidden" style="margin-bottom:10px">
+      <label class="muted" style="font-size:13px">مواضيع البحث (سطر لكل موضوع — تُبحث بالتناوب):</label>
+      <textarea id="am-topics" rows="3" placeholder="أسعار الذهب&#10;أخبار الذكاء الاصطناعي&#10;وصفات الطبخ المغربي">${escapeHtml((a?.researchTopics || []).join("\n"))}</textarea>
+      <p class="muted" style="font-size:12px;margin:4px 0 0">إن تُرك فارغاً سيبحث في فجواته المعرفية تلقائياً.</p>
+    </div>
     <label class="switch-row"><span>🔬 تفكير عميق <small class="muted">— تحليل + نقد ذاتي (يستهلك خلايا أكثر)</small></span><button type="button" class="switch" id="am-deepthink" role="switch" aria-label="التفكير العميق"></button></label>
     <div id="am-effort-row" class="hidden" style="margin-bottom:10px">
       <label class="muted" style="font-size:13px">مستوى الجهد:</label>
@@ -271,6 +277,17 @@ function openAgentModal(a) {
   const autoSw = $("am-autolearn");
   autoSw.classList.toggle("on", modalAutoLearn);
   autoSw.onclick = () => { modalAutoLearn = !modalAutoLearn; autoSw.classList.toggle("on", modalAutoLearn); };
+  // Autonomous research
+  modalAutoResearch = !!a?.autoResearch;
+  const arSw = $("am-autoresearch");
+  const topicsRow = $("am-topics-row");
+  arSw.classList.toggle("on", modalAutoResearch);
+  topicsRow.classList.toggle("hidden", !modalAutoResearch);
+  arSw.onclick = () => {
+    modalAutoResearch = !modalAutoResearch;
+    arSw.classList.toggle("on", modalAutoResearch);
+    topicsRow.classList.toggle("hidden", !modalAutoResearch);
+  };
   // Deep think
   modalDeepThink = !!a?.deepThink;
   modalEffort = a?.effort || "balanced";
@@ -290,7 +307,7 @@ function openAgentModal(a) {
   if (histBtn) histBtn.onclick = () => openHistorySheet(editingId);
   $("am-save").onclick = saveAgentModal;
 }
-let modalSkillIds = [], modalAutoLearn = false, modalDeepThink = false, modalEffort = "balanced", skillsCache = null;
+let modalSkillIds = [], modalAutoLearn = false, modalAutoResearch = false, modalDeepThink = false, modalEffort = "balanced", skillsCache = null;
 async function getSkillsCache() {
   if (!skillsCache) skillsCache = (await api("/api/skills")).skills;
   return skillsCache;
@@ -340,6 +357,8 @@ async function saveAgentModal() {
     description: $("am-desc").value, tone: $("am-tone").value,
     model: $("am-model").value, systemPrompt: $("am-prompt").value,
     tools: modalTools, skillIds: modalSkillIds, autoLearn: modalAutoLearn,
+    autoResearch: modalAutoResearch,
+    researchTopics: $("am-topics").value.split("\n").map((t) => t.trim()).filter(Boolean).slice(0, 10),
     deepThink: modalDeepThink, effort: modalEffort,
     expertise: $("am-expertise").value, style: $("am-style").value, avoidTopics: $("am-avoid").value,
   };
@@ -1402,7 +1421,7 @@ async function loadDashboard() {
     renderPerAgent(s.perAgent);
   } catch (e) { cards.innerHTML = `<div class="note err">${escapeHtml(errText(e))}</div>`; }
   loadLearnLog(); loadKnowledge(); loadTools(); loadReminders(); loadSkills();
-  loadGaps(); initBackup(); loadResearchHistory();
+  loadGaps(); initBackup(); loadResearchHistory(); loadTicker();
 }
 
 function renderPerAgent(perAgent) {
@@ -1451,6 +1470,25 @@ async function loadResearchHistory() {
       box.appendChild(d);
     }
   } catch { box.innerHTML = '<p class="muted">تعذّر التحميل</p>'; }
+}
+
+/* Live activity ticker */
+let tickerTimer = null;
+async function loadTicker() {
+  const ticker = $("ticker");
+  if (!ticker) return;
+  try {
+    const { items } = await api("/api/activity");
+    if (!items.length) {
+      ticker.innerHTML = '<span class="ticker-item">لا نشاط بعد — تحدث مع وكلائك وستظهر الأحداث هنا 📡</span>';
+    } else {
+      const html = items.map((i) =>
+        `<span class="ticker-item">${escapeHtml(i.icon)} <b>${escapeHtml(i.agent)}</b>: ${escapeHtml(i.text)}</span>`
+      ).join('<span class="ticker-sep">✦</span>');
+      ticker.innerHTML = `<div class="ticker-track">${html}<span class="ticker-sep">✦</span>${html}</div>`;
+    }
+  } catch { /* keep previous content */ }
+  if (!tickerTimer) tickerTimer = setInterval(loadTicker, 30000);
 }
 
 /* Smart training suggestions from knowledge gaps */
@@ -1558,7 +1596,7 @@ async function loadLearnLog() {
     const { events } = await api(`/api/learning-log/${id}`);
     const box = $("learn-log");
     box.innerHTML = events.length ? "" : '<p class="muted">لا أحداث بعد — تحدث مع الوكيل ثم اضغط "🧠 اجعله يتعلم".</p>';
-    const names = { memory: "🧠 ذاكرة", lesson: "💡 درس", gap: "❓ فجوة", training: "📄 تدريب", quality: "⭐ جودة", research: "🔬 بحث" };
+    const names = { memory: "🧠 ذاكرة", lesson: "💡 درس", gap: "❓ فجوة", training: "📄 تدريب", quality: "⭐ جودة", research: "🔬 بحث", "auto-research": "🛰️ بحث تلقائي" };
     for (const e of events.slice(0, 40)) {
       const d = document.createElement("div");
       d.className = "tl-item";
