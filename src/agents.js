@@ -21,6 +21,8 @@ export function defaultAgent(overrides = {}) {
     tools: ["calculator", "datetime", "url_fetch"],
     skillIds: [],
     autoLearn: false,
+    autoResearch: false,
+    researchTopics: [],
     deepThink: false,
     effort: "balanced",
     expertise: "",
