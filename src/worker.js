@@ -370,12 +370,12 @@ function buildSystemPrompt(agent, memories, learned, ragContext, skills) {
   return parts.join("\n\n");
 }
 
-async function getRagContext(env, kvH, agent, userText) {
+async function getRagHits(env, kvH, agent, userText, k = 5) {
   const files = (await kvH.get(`know:${agent.id}:files`)) || [];
-  if (!files.length) return "";
+  if (!files.length) return [];
   const emb = await env.AI.run(EMBEDDING_MODEL, { text: [userText.slice(0, 1000)] });
   const q = emb?.data?.[0];
-  if (!q) return "";
+  if (!q) return [];
   const allChunks = [];
   for (const f of files) {
     const rec = await kvH.get(`know:${agent.id}:${f.id}`);
@@ -383,9 +383,132 @@ async function getRagContext(env, kvH, agent, userText) {
       for (const c of rec.chunks) allChunks.push({ ...c, file: f.filename });
     }
   }
-  const hits = relevantChunks(allChunks, q, 5);
+  return relevantChunks(allChunks, q, k);
+}
+
+async function getRagContext(env, kvH, agent, userText) {
+  const hits = await getRagHits(env, kvH, agent, userText, 5);
   if (!hits.length) return "";
   return hits.map((h, i) => `[${i + 1}] (من ${h.file || "ملف التدريب"}): ${h.text}`).join("\n");
+}
+
+/* ---------------- deep research ---------------- */
+
+const RESEARCH_SYSTEM = `أنت باحث محلل محترف. أمامك موضوع بحث ومواد من مصادر متعددة.
+اكتب تقريراً بحثياً كاملاً بالعربية بهذا الهيكل:
+## ملخص تنفيذي
+(3-5 أسطر: أهم ما يجب معرفته)
+## النقاط الرئيسية
+(5-8 نقاط مرقمة، كل نقطة جملة واحدة دقيقة)
+## تحليل
+(فقرتان: ماذا تعني هذه المعلومات؟ وما الثغرات أو الأسئلة المفتوحة؟)
+## المصادر
+(اذكر: قاعدة المعرفة الداخلية / الويب — بعناوينها)
+كن دقيقاً وموضوعياً. إن تعارضت المصادر اذكر التعارض. لا تخترع معلومات.`;
+
+async function runDeepResearch(env, kvH, agent, query, send) {
+  const startedAt = new Date().toISOString();
+  const kbHits = [];
+  const webSources = [];
+  let neurons = 0;
+
+  send({ type: "research", stage: "start", query });
+
+  // Stage 1: internal knowledge base first
+  send({ type: "research", stage: "kb", state: "start" });
+  try {
+    const hits = await getRagHits(env, kvH, agent, query, 6);
+    for (const h of hits) kbHits.push({ file: h.file || "ملف التدريب", text: h.text });
+    neurons += embeddingNeurons(query.length);
+  } catch { /* no kb */ }
+  send({
+    type: "research", stage: "kb", state: "done", hits: kbHits.length,
+    files: [...new Set(kbHits.map((h) => h.file))].slice(0, 5),
+  });
+
+  // Stage 2: web when the KB is not enough
+  const needWeb = kbHits.length < 2;
+  if (needWeb) {
+    send({ type: "research", stage: "web", state: "start" });
+    try {
+      const wsTool = getBuiltinTool("web_search");
+      const out = await wsTool.run({ query }, { fetch, agent, env });
+      const results = (out.results || []).slice(0, 4);
+      const fetchTool = getBuiltinTool("url_fetch");
+      for (const r of results) {
+        send({ type: "research", stage: "fetch", state: "progress", title: r.title });
+        try {
+          const page = await fetchTool.run({ url: r.url, maxChars: 3000 }, { fetch, agent, env });
+          const text = String(page.text || page.content || "").slice(0, 3000);
+          if (text.length > 200) webSources.push({ title: r.title, url: r.url, text });
+        } catch { /* skip failed source */ }
+      }
+    } catch { /* web failed — continue with KB only */ }
+    send({
+      type: "research", stage: "web", state: "done",
+      sources: webSources.map((s) => ({ title: s.title, url: s.url })),
+    });
+  } else {
+    send({ type: "research", stage: "web", state: "skipped", reason: "kb-sufficient" });
+  }
+
+  // Stage 3: analyze & synthesize
+  send({ type: "research", stage: "analyze", state: "start" });
+  const kbText = kbHits.map((h, i) => `[معرفة ${i + 1} — ${h.file}]: ${h.text}`).join("\n");
+  const webText = webSources.map((s, i) => `[مصدر ${i + 1} — ${s.title}]: ${s.text}`).join("\n");
+  const material = `${kbText ? "من قاعدة المعرفة:\n" + kbText + "\n\n" : ""}${webText ? "من الويب:\n" + webText : ""}`;
+  const { result } = await runChatLLM(env, agent.model, [
+    { role: "system", content: RESEARCH_SYSTEM },
+    { role: "user", content: `موضوع البحث: ${query}\n\n${material || "(لا مواد متاحة — اكتب من معرفتك العامة مع التنبيه لذلك)"}\n\nاكتب التقرير الكامل.` },
+  ], 1500);
+  const report = typeof result?.response === "string" ? result.response.trim() : "";
+  neurons += chatNeurons(agent.model, material.length + 500, report.length);
+  send({ type: "research", stage: "analyze", state: "done" });
+
+  // Stage 4: learn — distill lessons into the agent's mind
+  send({ type: "research", stage: "learn", state: "start" });
+  const lessons = [];
+  try {
+    const { result: lr } = await runChatLLM(env, agent.model, [
+      { role: "system", content: `استخرج أهم 3-5 حقائق أو دروس من هذا التقرير البحثي. أعد JSON فقط: {"lessons":["..."]}` },
+      { role: "user", content: `الموضوع: ${query}\n\nالتقرير:\n${report.slice(0, 4000)}` },
+    ], 500);
+    const m = String(lr?.response || "").match(/\{[\s\S]*\}/);
+    if (m) {
+      const arr = JSON.parse(m[0]).lessons || [];
+      const learned = (await kvH.get(`learned:${agent.id}`)) || [];
+      for (const t of arr.slice(0, 5)) {
+        const txt = String(t).slice(0, 300);
+        if (txt.length > 10) {
+          lessons.push(txt);
+          learned.push({ text: txt, at: startedAt, source: "research" });
+        }
+      }
+      await kvH.set(`learned:${agent.id}`, learned.slice(-50));
+      const log = (await kvH.get(`learn:${agent.id}`)) || [];
+      log.push({
+        at: startedAt, event: "research",
+        detail: `بحث معمق: "${query}" — ${webSources.length} مصادر ويب، ${kbHits.length} من المعرفة، ${lessons.length} دروس محفوظة.`,
+      });
+      await kvH.set(`learn:${agent.id}`, log.slice(-200));
+    }
+    neurons += chatNeurons(agent.model, 1500, 500);
+  } catch { /* learning must never break research */ }
+  send({ type: "research", stage: "learn", state: "done", lessons: lessons.length });
+
+  // Save the research record
+  const rec = {
+    id: "rs_" + Date.now().toString(36), query, at: startedAt,
+    kbHits: kbHits.length, webSources: webSources.length,
+    lessons: lessons.length, summary: report.slice(0, 600),
+  };
+  const list = (await kvH.get(`research:${agent.id}`)) || [];
+  list.unshift(rec);
+  await kvH.set(`research:${agent.id}`, list.slice(0, 20));
+  await bumpStat(kvH, "neurons", neurons);
+
+  send({ type: "research", stage: "done", id: rec.id });
+  return { report, rec };
 }
 
 async function handleChat(req, env, kvH, waitCtx) {
@@ -396,6 +519,15 @@ async function handleChat(req, env, kvH, waitCtx) {
   }
   const userText = String(body.message || "").trim().slice(0, 4000);
   if (!userText) return json({ code: "bad", message: "الرسالة فارغة" }, 400);
+  // Deep-research trigger: "ابحث بعمق عن ..." / "بحث معمق: ..."
+  let researchQuery = "";
+  const rm = userText.match(/^(ابحث بعمق عن|بحث معمق عن|بحث معمق:|deep research:?)\s*([\s\S]+)/i);
+  if (rm && rm[2].trim()) {
+    researchQuery = rm[2].trim().slice(0, 500);
+  } else if (/ابحث بعمق/i.test(userText)) {
+    const q = userText.replace(/ابحث بعمق( عن)?/gi, "").replace(/[:،,]/g, " ").trim();
+    if (q.length > 2) researchQuery = q.slice(0, 500);
+  }
   let conv = null;
   if (body.conversationId) conv = await kvH.get(`conv:${body.conversationId}`);
   if (!conv) {
@@ -426,10 +558,27 @@ async function handleChat(req, env, kvH, waitCtx) {
           ragContext = "";
         }
 
+        // Shared answer state
+        let full = "";
+        let modelId = agent.model;
+        let system = "";
+        const imageIds = [];
+        let skipFinalNeurons = false;
+
+        if (researchQuery) {
+          // Deep-research mode: KB -> web -> analyze -> learn, with live map
+          const { report } = await runDeepResearch(env, kvH, agent, researchQuery, send);
+          full = report;
+          for (let i = 0; i < full.length; i += 48) {
+            send({ type: "token", text: full.slice(i, i + 48) });
+          }
+          toolsUsed.push("🔬 بحث معمق");
+          skipFinalNeurons = true; // already accounted inside runDeepResearch
+        } else {
+
         // Phase 1: decide tools (chains: up to 3 rounds)
         const enabledTools = (agent.tools || []).map(getBuiltinTool).filter(Boolean);
         let toolResultText = "";
-        const imageIds = [];
         const MAX_TOOL_ROUNDS = 3;
         try {
           const toolCtx = {
@@ -477,7 +626,7 @@ async function handleChat(req, env, kvH, waitCtx) {
         }
 
         // Phase 2: build the final answer
-        const system = buildSystemPrompt(agent, memories, learned, ragContext, skills);
+        system = buildSystemPrompt(agent, memories, learned, ragContext, skills);
         const history = (conv.messages || []).slice(-30).map((m) => ({
           role: m.role === "user" ? "user" : "assistant", content: m.content,
         }));
@@ -486,8 +635,8 @@ async function handleChat(req, env, kvH, waitCtx) {
           ...history,
           { role: "user", content: userText + (toolResultText ? `\n\n${toolResultText}` : "") + (thinkingText ? `\n\nتحليلك العميق (اعتمد عليه):\n${thinkingText}` : "") },
         ];
-        let full = "";
-        let modelId = agent.model;
+        full = "";
+        modelId = agent.model;
         if (deepOn && effort === "deep") {
           // Deep mode: draft (non-stream) -> self-critique -> stream the refined answer
           send({ type: "thinking", state: "critique" });
@@ -534,6 +683,8 @@ async function handleChat(req, env, kvH, waitCtx) {
           }
         }
 
+        } // end normal chat flow (non-research)
+
         // Persist
         conv.messages.push({ role: "user", content: userText });
         conv.messages.push({ role: "assistant", content: full, tools: toolsUsed, images: imageIds });
@@ -548,7 +699,9 @@ async function handleChat(req, env, kvH, waitCtx) {
         }
         await bumpStat(kvH, "messages", 2);
         await bumpStat(kvH, `agent:${agent.id}:messages`, 2);
-        await bumpStat(kvH, "neurons", chatNeurons(modelId, system.length + userText.length, full.length));
+        if (!skipFinalNeurons) {
+          await bumpStat(kvH, "neurons", chatNeurons(modelId, system.length + userText.length, full.length));
+        }
 
         send({ type: "done", tools: toolsUsed, images: imageIds });
         controller.close();
@@ -817,7 +970,7 @@ async function handleBrain(kvH, agentId) {
     link(A, id);
   }
   const log = (await kvH.get(`learn:${agent.id}`)) || [];
-  const evIcon = { memory: "🧠", lesson: "💡", gap: "❓", training: "📄", quality: "⭐" };
+  const evIcon = { memory: "🧠", lesson: "💡", gap: "❓", training: "📄", quality: "⭐", research: "🔬" };
   for (const e of log.slice(-12)) {
     const id = `ev${i++}`;
     add(id, (e.detail || "").slice(0, 42), "event", evIcon[e.event] || "✨", e.detail);
@@ -1166,6 +1319,13 @@ export default {
         } catch (e) {
           return json({ code: "bad", message: "ملف النسخة غير صالح", detail: errDetail(e) }, 400);
         }
+      }
+
+      // Research history per agent
+      if (path.match(/^\/api\/research\/[^/]+$/) && request.method === "GET") {
+        const agentId = path.split("/")[3];
+        const list = (await kvH.get(`research:${agentId}`)) || [];
+        return json({ research: list });
       }
 
       // Training suggestions: recent knowledge gaps across agents
